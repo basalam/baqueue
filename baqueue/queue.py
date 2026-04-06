@@ -9,7 +9,7 @@ from baqueue.drivers.base import BaseDriver
 from baqueue.drivers.memory_driver import MemoryDriver
 from baqueue.events import EventBus
 from baqueue.job import Job, FunctionJob
-from baqueue.serializer import JobPayload, get_class_path, _now_ts
+from baqueue.serializer import JobPayload, _now_ts
 
 
 class Queue:

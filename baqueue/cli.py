@@ -54,7 +54,7 @@ def _run_async(coro_fn, *args: Any, **kwargs: Any) -> Any:
         sys.exit(1)
     except OSError as e:
         if "10048" in str(e) or "address already in use" in str(e).lower():
-            click.echo(f"Error: Port is already in use. Kill the existing process or use a different port.", err=True)
+            click.echo("Error: Port is already in use. Kill the existing process or use a different port.", err=True)
         else:
             click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -111,7 +111,7 @@ def work(
 
     _validate_driver(driver)
 
-    click.echo(f"BaQueue worker starting...")
+    click.echo("BaQueue worker starting...")
     click.echo(f"  Driver:  {config.driver.name}")
     click.echo(f"  Queues:  {', '.join(queue)}")
     click.echo(f"  Workers: {workers}")

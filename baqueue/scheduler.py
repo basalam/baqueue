@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
 
 from croniter import croniter
 
 from baqueue.config import ScheduleEntry
 from baqueue.drivers.base import BaseDriver
 from baqueue.events import EventBus
-from baqueue.serializer import JobPayload, resolve_job_class, _now_ts
+from baqueue.serializer import JobPayload, resolve_job_class
 
 logger = logging.getLogger("baqueue.scheduler")
 

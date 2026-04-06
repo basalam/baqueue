@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
 import traceback
 from typing import Any
 
@@ -12,7 +11,7 @@ from baqueue.drivers.base import BaseDriver
 from baqueue.events import EventBus
 from baqueue.job import Job, FunctionJob
 from baqueue.retry import compute_delay, should_retry
-from baqueue.serializer import JobPayload, resolve_job_class, _now_ts
+from baqueue.serializer import JobPayload, resolve_job_class
 
 logger = logging.getLogger("baqueue.worker")
 

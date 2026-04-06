@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
 from baqueue.config import BaQueueConfig
 from baqueue.drivers.base import BaseDriver

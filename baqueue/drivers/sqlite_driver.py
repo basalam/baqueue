@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from pathlib import Path
 from typing import Any
 
 from baqueue.drivers.base import BaseDriver

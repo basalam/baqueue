@@ -143,12 +143,12 @@ async def main(
     await Queue.flush()
 
     print(f"\n{'='*60}")
-    print(f"  BaQueue Stress Test")
+    print("  BaQueue Stress Test")
     print(f"{'='*60}")
     print(f"  Jobs:    {num_jobs}")
     print(f"  Workers: {num_workers}")
     print(f"  Bulk:    {use_bulk}")
-    print(f"  Driver:  sqlite (.baqueue.db)")
+    print("  Driver:  sqlite (.baqueue.db)")
     print(f"{'='*60}\n")
 
     # ── Dispatch ──────────────────────────────────────────
@@ -159,8 +159,6 @@ async def main(
         (FlakyJob,  0.20),  # 20%
         (HeavyJob,  0.10),  # 10%
     ]
-    notify_pct = 0.15  # 15%
-
     print("  Dispatching jobs...")
     t0 = time.time()
 
@@ -253,7 +251,7 @@ async def _run_monitor(tracker, driver, supervisor):
     elapsed, completed, failed, rate = await tracker.monitor(driver)
 
     print(f"\n{'='*60}")
-    print(f"  RESULTS")
+    print("  RESULTS")
     print(f"{'='*60}")
     print(f"  Total time:    {elapsed:.2f}s")
     print(f"  Completed:     {completed}")
