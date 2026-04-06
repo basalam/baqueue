@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.baqueue.db
+.env
+*.db-journal
+*.db-wal
+*.db-shm
