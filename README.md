@@ -2,9 +2,6 @@
 
 A powerful Python queue management package. Multi-driver support, batch jobs, scheduling, auto-balancing, and a beautiful real-time monitoring dashboard.
 
-## Features
-
-- **Multi-driver**: SQLite (default), Redis, PostgreSQL, or In-Memory
 ![Overview](./baqueue/screen/1.png)
 
 ### Jobs - Filterable job list with status, attempts, and duration
@@ -13,7 +10,8 @@ A powerful Python queue management package. Multi-driver support, batch jobs, sc
 ### Queues - Per-queue detail cards with pending/processing/completed/failed
 ![Queues](./baqueue/screen/3.png)
 
-fixed, linear, exponential, or custom strategies
+## Features
+- **Multi-driver**: SQLite (default), Redis, PostgreSQL, or In-Memory
 - **Auto-balancing**: Dynamically scale workers based on queue pressure
 - **Pruning**: Remove old jobs by status, tag, or age
 - **Monitoring Dashboard**: Real-time WebSocket-powered UI with date filtering
