@@ -31,7 +31,13 @@ class RedisDriver(BaseDriver):
         return ":".join([self._prefix, *parts])
 
     async def connect(self) -> None:
-        import redis.asyncio as aioredis
+        try:
+            import redis.asyncio as aioredis
+        except ImportError:
+            raise ImportError(
+                "Redis driver requires the 'redis' package.\n"
+                "Install it with: pip install baqueue[redis]"
+            ) from None
         self._redis = aioredis.from_url(self._url, decode_responses=True, **self._kwargs)
         await self._redis.ping()
 

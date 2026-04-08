@@ -37,7 +37,13 @@ class PostgresDriver(BaseDriver):
         return f"{self._prefix}_metrics"
 
     async def connect(self) -> None:
-        import asyncpg
+        try:
+            import asyncpg
+        except ImportError:
+            raise ImportError(
+                "PostgreSQL driver requires the 'asyncpg' package.\n"
+                "Install it with: pip install baqueue[postgres]"
+            ) from None
         self._pool = await asyncpg.create_pool(self._url, **self._kwargs)
         await self._ensure_tables()
 

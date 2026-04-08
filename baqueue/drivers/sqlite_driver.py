@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from typing import Any
 
@@ -15,6 +16,10 @@ from baqueue.drivers.base import BaseDriver
 from baqueue.serializer import JobPayload, _now_ts
 
 DEFAULT_DB_PATH = ".baqueue.db"
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 0.05
+
+logger = logging.getLogger("baqueue.sqlite")
 
 
 class SqliteDriver(BaseDriver):
@@ -32,16 +37,31 @@ class SqliteDriver(BaseDriver):
         return self._conn
 
     async def connect(self) -> None:
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._conn = sqlite3.connect(self._path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA busy_timeout=15000")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA wal_autocheckpoint=1000")
         self._ensure_tables()
 
     async def disconnect(self) -> None:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    async def _execute_with_retry(self, fn):
+        """Execute a database operation with retry on 'database is locked'."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                return fn()
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e) and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.debug("Database locked, retry %d/%d in %.2fs", attempt + 1, MAX_RETRIES, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     def _ensure_tables(self) -> None:
         c = self._get_conn()
@@ -122,107 +142,126 @@ class SqliteDriver(BaseDriver):
         payload.status = "pending"
         payload.updated_at = _now_ts()
         backoff_str = json.dumps(payload.backoff) if isinstance(payload.backoff, list) else payload.backoff
+        params = (payload.id, payload.job_class, json.dumps(payload.data),
+                  payload.queue, payload.status, payload.attempts, payload.max_attempts,
+                  backoff_str, payload.timeout, json.dumps(payload.tags),
+                  payload.batch_id, payload.delay_until,
+                  payload.created_at, payload.updated_at)
+
         async with self._lock:
-            self._get_conn().execute(
-                """INSERT OR REPLACE INTO jobs
-                   (id, job_class, data, queue, status, attempts, max_attempts,
-                    backoff, timeout, tags, batch_id, delay_until, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (payload.id, payload.job_class, json.dumps(payload.data),
-                 payload.queue, payload.status, payload.attempts, payload.max_attempts,
-                 backoff_str, payload.timeout, json.dumps(payload.tags),
-                 payload.batch_id, payload.delay_until,
-                 payload.created_at, payload.updated_at),
-            )
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute(
+                    """INSERT OR REPLACE INTO jobs
+                       (id, job_class, data, queue, status, attempts, max_attempts,
+                        backoff, timeout, tags, batch_id, delay_until, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", params)
+                c.commit()
+            await self._execute_with_retry(_do)
         return payload.id
 
     async def push_many(self, payloads: list[JobPayload]) -> list[str]:
         now = _now_ts()
         ids = []
+        rows = []
+        for p in payloads:
+            p.status = "pending"
+            p.updated_at = now
+            backoff_str = json.dumps(p.backoff) if isinstance(p.backoff, list) else p.backoff
+            rows.append((p.id, p.job_class, json.dumps(p.data),
+                         p.queue, p.status, p.attempts, p.max_attempts,
+                         backoff_str, p.timeout, json.dumps(p.tags),
+                         p.batch_id, p.delay_until, p.created_at, p.updated_at))
+            ids.append(p.id)
+
         async with self._lock:
-            c = self._get_conn()
-            for p in payloads:
-                p.status = "pending"
-                p.updated_at = now
-                backoff_str = json.dumps(p.backoff) if isinstance(p.backoff, list) else p.backoff
-                c.execute(
+            def _do():
+                c = self._get_conn()
+                c.executemany(
                     """INSERT OR REPLACE INTO jobs
                        (id, job_class, data, queue, status, attempts, max_attempts,
                         backoff, timeout, tags, batch_id, delay_until, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (p.id, p.job_class, json.dumps(p.data),
-                     p.queue, p.status, p.attempts, p.max_attempts,
-                     backoff_str, p.timeout, json.dumps(p.tags),
-                     p.batch_id, p.delay_until,
-                     p.created_at, p.updated_at),
-                )
-                ids.append(p.id)
-            c.commit()
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+                c.commit()
+            await self._execute_with_retry(_do)
         return ids
 
     async def pop(self, queue: str) -> JobPayload | None:
         now = _now_ts()
         async with self._lock:
-            c = self._get_conn()
-            row = c.execute(
-                """SELECT * FROM jobs
-                   WHERE queue=? AND status='pending'
-                     AND (delay_until IS NULL OR delay_until <= ?)
-                   ORDER BY created_at ASC LIMIT 1""",
-                (queue, now),
-            ).fetchone()
-            if not row:
-                return None
-            c.execute(
-                "UPDATE jobs SET status='processing', started_at=?, updated_at=?, attempts=attempts+1 WHERE id=?",
-                (now, now, row["id"]),
-            )
-            c.commit()
-            payload = self._row_to_payload(row)
-            payload.status = "processing"
-            payload.started_at = now
-            payload.updated_at = now
-            payload.attempts += 1
-            return payload
+            result = [None]
+            def _do():
+                c = self._get_conn()
+                row = c.execute(
+                    """SELECT * FROM jobs
+                       WHERE queue=? AND status='pending'
+                         AND (delay_until IS NULL OR delay_until <= ?)
+                       ORDER BY created_at ASC LIMIT 1""",
+                    (queue, now),
+                ).fetchone()
+                if not row:
+                    return
+                c.execute(
+                    "UPDATE jobs SET status='processing', started_at=?, updated_at=?, attempts=attempts+1 WHERE id=?",
+                    (now, now, row["id"]),
+                )
+                c.commit()
+                payload = self._row_to_payload(row)
+                payload.status = "processing"
+                payload.started_at = now
+                payload.updated_at = now
+                payload.attempts += 1
+                result[0] = payload
+            await self._execute_with_retry(_do)
+            return result[0]
 
     async def pop_delayed(self) -> list[JobPayload]:
         now = _now_ts()
         async with self._lock:
-            c = self._get_conn()
-            rows = c.execute(
-                "SELECT * FROM jobs WHERE status='pending' AND delay_until IS NOT NULL AND delay_until <= ?",
-                (now,),
-            ).fetchall()
-            if rows:
-                c.execute(
-                    "UPDATE jobs SET delay_until=NULL, updated_at=? WHERE status='pending' AND delay_until IS NOT NULL AND delay_until <= ?",
-                    (now, now),
-                )
-                c.commit()
-            return [self._row_to_payload(r) for r in rows]
+            results = []
+            def _do():
+                c = self._get_conn()
+                rows = c.execute(
+                    "SELECT * FROM jobs WHERE status='pending' AND delay_until IS NOT NULL AND delay_until <= ?",
+                    (now,),
+                ).fetchall()
+                if rows:
+                    c.execute(
+                        "UPDATE jobs SET delay_until=NULL, updated_at=? WHERE status='pending' AND delay_until IS NOT NULL AND delay_until <= ?",
+                        (now, now),
+                    )
+                    c.commit()
+                results.extend([self._row_to_payload(r) for r in rows])
+            await self._execute_with_retry(_do)
+            return results
 
     # ── Job lifecycle ───────────────────────────────────────────
 
     async def complete(self, payload: JobPayload) -> None:
         now = _now_ts()
         async with self._lock:
-            self._get_conn().execute(
-                "UPDATE jobs SET status='completed', completed_at=?, updated_at=? WHERE id=?",
-                (now, now, payload.id),
-            )
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute(
+                    "UPDATE jobs SET status='completed', completed_at=?, updated_at=? WHERE id=?",
+                    (now, now, payload.id),
+                )
+                c.commit()
+            await self._execute_with_retry(_do)
         payload.status = "completed"
         payload.completed_at = now
 
     async def fail(self, payload: JobPayload, error: str) -> None:
         now = _now_ts()
         async with self._lock:
-            self._get_conn().execute(
-                "UPDATE jobs SET status='failed', failed_at=?, updated_at=?, error=? WHERE id=?",
-                (now, now, error, payload.id),
-            )
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute(
+                    "UPDATE jobs SET status='failed', failed_at=?, updated_at=?, error=? WHERE id=?",
+                    (now, now, error, payload.id),
+                )
+                c.commit()
+            await self._execute_with_retry(_do)
         payload.status = "failed"
         payload.failed_at = now
         payload.error = error
@@ -231,16 +270,22 @@ class SqliteDriver(BaseDriver):
         now = _now_ts()
         delay_until = now + delay if delay > 0 else None
         async with self._lock:
-            self._get_conn().execute(
-                "UPDATE jobs SET status='pending', updated_at=?, delay_until=? WHERE id=?",
-                (now, delay_until, payload.id),
-            )
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute(
+                    "UPDATE jobs SET status='pending', updated_at=?, delay_until=? WHERE id=?",
+                    (now, delay_until, payload.id),
+                )
+                c.commit()
+            await self._execute_with_retry(_do)
 
     async def delete(self, job_id: str) -> None:
         async with self._lock:
-            self._get_conn().execute("DELETE FROM jobs WHERE id=?", (job_id,))
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+                c.commit()
+            await self._execute_with_retry(_do)
 
     # ── Query ───────────────────────────────────────────────────
 
@@ -326,12 +371,14 @@ class SqliteDriver(BaseDriver):
     # ── Metrics ─────────────────────────────────────────────────
 
     async def record_metric(self, queue: str, metric: str, value: float) -> None:
+        ts = _now_ts()
         async with self._lock:
-            self._get_conn().execute(
-                "INSERT INTO metrics (queue, metric, value, recorded_at) VALUES (?,?,?,?)",
-                (queue, metric, value, _now_ts()),
-            )
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute("INSERT INTO metrics (queue, metric, value, recorded_at) VALUES (?,?,?,?)",
+                          (queue, metric, value, ts))
+                c.commit()
+            await self._execute_with_retry(_do)
 
     async def get_metrics(self, queue: str | None = None) -> dict[str, Any]:
         if queue:
@@ -366,12 +413,13 @@ class SqliteDriver(BaseDriver):
     # ── Batch helpers ───────────────────────────────────────────
 
     async def store_batch(self, batch_id: str, data: dict[str, Any]) -> None:
+        json_data = json.dumps(data)
         async with self._lock:
-            self._get_conn().execute(
-                "INSERT OR REPLACE INTO batches (id, data) VALUES (?, ?)",
-                (batch_id, json.dumps(data)),
-            )
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute("INSERT OR REPLACE INTO batches (id, data) VALUES (?, ?)", (batch_id, json_data))
+                c.commit()
+            await self._execute_with_retry(_do)
 
     async def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         row = self._get_conn().execute("SELECT data FROM batches WHERE id=?", (batch_id,)).fetchone()
@@ -380,12 +428,13 @@ class SqliteDriver(BaseDriver):
         return None
 
     async def update_batch(self, batch_id: str, data: dict[str, Any]) -> None:
+        json_data = json.dumps(data)
         async with self._lock:
-            self._get_conn().execute(
-                "UPDATE batches SET data=? WHERE id=?",
-                (json.dumps(data), batch_id),
-            )
-            self._get_conn().commit()
+            def _do():
+                c = self._get_conn()
+                c.execute("UPDATE batches SET data=? WHERE id=?", (json_data, batch_id))
+                c.commit()
+            await self._execute_with_retry(_do)
 
     # ── Pruning ─────────────────────────────────────────────────
 
@@ -417,17 +466,23 @@ class SqliteDriver(BaseDriver):
             return 0
 
         where = " AND ".join(conditions)
+        result = [0]
         async with self._lock:
-            c = self._get_conn()
-            cursor = c.execute(f"DELETE FROM jobs WHERE {where}", params)
-            c.commit()
-            return cursor.rowcount
+            def _do():
+                c = self._get_conn()
+                cursor = c.execute(f"DELETE FROM jobs WHERE {where}", params)
+                c.commit()
+                result[0] = cursor.rowcount
+            await self._execute_with_retry(_do)
+            return result[0]
 
     async def flush(self, queue: str | None = None) -> None:
         async with self._lock:
-            c = self._get_conn()
-            if queue:
-                c.execute("DELETE FROM jobs WHERE queue=?", (queue,))
-            else:
-                c.executescript("DELETE FROM jobs; DELETE FROM batches; DELETE FROM metrics;")
-            c.commit()
+            def _do():
+                c = self._get_conn()
+                if queue:
+                    c.execute("DELETE FROM jobs WHERE queue=?", (queue,))
+                else:
+                    c.executescript("DELETE FROM jobs; DELETE FROM batches; DELETE FROM metrics;")
+                c.commit()
+            await self._execute_with_retry(_do)

@@ -49,6 +49,9 @@ def _run_async(coro_fn, *args: Any, **kwargs: Any) -> Any:
         return asyncio.run(coro_fn(*args, **kwargs))
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
+    except ImportError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
     except ConnectionError as e:
         click.echo(f"Error: Connection failed - {e}", err=True)
         sys.exit(1)

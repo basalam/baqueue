@@ -167,10 +167,22 @@ def _create_driver(config: BaQueueConfig) -> BaseDriver:
         path = config.driver.url or ".baqueue.db"
         return SqliteDriver(path=path, **config.driver.options)
     elif name == "redis":
-        from baqueue.drivers.redis_driver import RedisDriver
+        try:
+            from baqueue.drivers.redis_driver import RedisDriver
+        except ImportError:
+            raise ImportError(
+                "Redis driver requires the 'redis' package.\n"
+                "Install it with: pip install baqueue[redis]"
+            ) from None
         return RedisDriver(config.driver.url, prefix=config.prefix, **config.driver.options)
     elif name == "postgres":
-        from baqueue.drivers.postgres_driver import PostgresDriver
+        try:
+            from baqueue.drivers.postgres_driver import PostgresDriver
+        except ImportError:
+            raise ImportError(
+                "PostgreSQL driver requires the 'asyncpg' package.\n"
+                "Install it with: pip install baqueue[postgres]"
+            ) from None
         return PostgresDriver(config.driver.url, prefix=config.prefix, **config.driver.options)
     else:
         raise ValueError(f"Unknown driver: {name}")
