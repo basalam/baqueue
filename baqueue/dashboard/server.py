@@ -7,6 +7,7 @@ which breaks with PEP 563 deferred annotations.
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,15 +19,53 @@ logger = logging.getLogger("baqueue.dashboard")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+OVERVIEW_BROADCAST_INTERVAL = 2.0
+
 
 def create_app(driver: BaseDriver, config: Optional[BaQueueConfig] = None) -> Any:
     """Create and return a FastAPI application for the dashboard."""
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
     from fastapi.responses import JSONResponse, FileResponse
 
-    app = FastAPI(title="BaQueue Dashboard", version="0.2.0")
     api = DashboardAPI(driver)
     connected_ws: list[WebSocket] = []
+
+    async def _broadcast_loop() -> None:
+        """One overview() per interval, fanned out to every connected WS.
+        Replaces N independent driver queries when N tabs are open."""
+        while True:
+            try:
+                await asyncio.sleep(OVERVIEW_BROADCAST_INTERVAL)
+                if not connected_ws:
+                    continue
+                data = await api.overview()
+                stale: list[WebSocket] = []
+                for ws in list(connected_ws):
+                    try:
+                        await ws.send_json(data)
+                    except Exception:
+                        stale.append(ws)
+                for ws in stale:
+                    if ws in connected_ws:
+                        connected_ws.remove(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error in overview broadcast loop")
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        task = asyncio.create_task(_broadcast_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    app = FastAPI(title="BaQueue Dashboard", version="0.2.0", lifespan=lifespan)
 
     # ── Static files ────────────────────────────────────────────
 
@@ -130,10 +169,11 @@ def create_app(driver: BaseDriver, config: Optional[BaQueueConfig] = None) -> An
         await ws.accept()
         connected_ws.append(ws)
         try:
+            data = await api.overview()
+            await ws.send_json(data)
             while True:
-                data = await api.overview()
-                await ws.send_json(data)
-                await asyncio.sleep(2)
+                # Keep the connection alive; the broadcaster pushes updates.
+                await ws.receive_text()
         except WebSocketDisconnect:
             pass
         except Exception:

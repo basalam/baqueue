@@ -77,8 +77,16 @@ class PostgresDriver(BaseDriver):
                 )
             """)
             await conn.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_{self._prefix}_queue_status
-                ON {self._jobs_table} (queue, status)
+                CREATE INDEX IF NOT EXISTS idx_{self._prefix}_queue_status_created
+                ON {self._jobs_table} (queue, status, created_at DESC)
+            """)
+            await conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._prefix}_created_at
+                ON {self._jobs_table} (created_at DESC)
+            """)
+            await conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._prefix}_status_created
+                ON {self._jobs_table} (status, created_at DESC)
             """)
             await conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._prefix}_delay
@@ -88,6 +96,7 @@ class PostgresDriver(BaseDriver):
                 CREATE INDEX IF NOT EXISTS idx_{self._prefix}_batch
                 ON {self._jobs_table} (batch_id) WHERE batch_id IS NOT NULL
             """)
+            await conn.execute(f"DROP INDEX IF EXISTS idx_{self._prefix}_queue_status")
             await conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self._batches_table} (
                     id TEXT PRIMARY KEY,
@@ -102,6 +111,14 @@ class PostgresDriver(BaseDriver):
                     value DOUBLE PRECISION NOT NULL,
                     recorded_at DOUBLE PRECISION NOT NULL
                 )
+            """)
+            await conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._prefix}_metrics_queue_metric
+                ON {self._metrics_table} (queue, metric)
+            """)
+            await conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._prefix}_metrics_recorded_at
+                ON {self._metrics_table} (recorded_at)
             """)
 
     def _row_to_payload(self, row: Any) -> JobPayload:
@@ -254,20 +271,19 @@ class PostgresDriver(BaseDriver):
             row = await conn.fetchrow(f"SELECT * FROM {self._jobs_table} WHERE id=$1", job_id)
         return self._row_to_payload(row) if row else None
 
-    async def get_jobs(
+    def _build_where(
         self,
         queue: str | None = None,
         status: str | None = None,
         tag: str | None = None,
         batch_id: str | None = None,
-        offset: int = 0,
-        limit: int = 50,
         created_from: float | None = None,
         created_to: float | None = None,
-    ) -> list[JobPayload]:
-        conditions = []
+        start_idx: int = 1,
+    ) -> tuple[str, list[Any], int]:
+        conditions: list[str] = []
         params: list[Any] = []
-        idx = 1
+        idx = start_idx
 
         if queue:
             conditions.append(f"queue=${idx}")
@@ -295,6 +311,22 @@ class PostgresDriver(BaseDriver):
             idx += 1
 
         where = " AND ".join(conditions) if conditions else "TRUE"
+        return where, params, idx
+
+    async def get_jobs(
+        self,
+        queue: str | None = None,
+        status: str | None = None,
+        tag: str | None = None,
+        batch_id: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+        created_from: float | None = None,
+        created_to: float | None = None,
+    ) -> list[JobPayload]:
+        where, params, idx = self._build_where(
+            queue, status, tag, batch_id, created_from, created_to,
+        )
         params.extend([limit, offset])
 
         async with self._pool.acquire() as conn:
@@ -303,6 +335,24 @@ class PostgresDriver(BaseDriver):
                 *params,
             )
         return [self._row_to_payload(r) for r in rows]
+
+    async def count_jobs(
+        self,
+        queue: str | None = None,
+        status: str | None = None,
+        created_from: float | None = None,
+        created_to: float | None = None,
+    ) -> int:
+        where, params, _ = self._build_where(
+            queue=queue, status=status,
+            created_from=created_from, created_to=created_to,
+        )
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT COUNT(*) AS cnt FROM {self._jobs_table} WHERE {where}",
+                *params,
+            )
+        return int(row["cnt"]) if row else 0
 
     async def size(self, queue: str) -> int:
         async with self._pool.acquire() as conn:
@@ -373,6 +423,28 @@ class PostgresDriver(BaseDriver):
                 json.dumps(data), batch_id,
             )
 
+    async def increment_batch_counter(
+        self, batch_id: str, field: str, delta: int = 1,
+    ) -> dict[str, Any] | None:
+        # jsonb_set with COALESCE so missing fields start at 0. Returns the
+        # post-update row in a single statement -> atomic.
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""UPDATE {self._batches_table}
+                    SET data = jsonb_set(
+                        data,
+                        ARRAY[$1],
+                        to_jsonb(COALESCE((data->>$1)::int, 0) + $2)
+                    )
+                    WHERE id = $3
+                    RETURNING data""",
+                field, delta, batch_id,
+            )
+        if row is None:
+            return None
+        raw = row["data"]
+        return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
     # ── Pruning ─────────────────────────────────────────────────
 
     async def prune(
@@ -418,3 +490,36 @@ class PostgresDriver(BaseDriver):
                 await conn.execute(f"DELETE FROM {self._jobs_table} WHERE queue=$1", queue)
             else:
                 await conn.execute(f"TRUNCATE {self._jobs_table}, {self._batches_table}, {self._metrics_table}")
+
+    async def prune_metrics(self, older_than_seconds: float) -> int:
+        cutoff = _now_ts() - older_than_seconds
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                f"DELETE FROM {self._metrics_table} WHERE recorded_at < $1", cutoff,
+            )
+        return int(result.split()[-1])
+
+    async def recent_throughput(
+        self, seconds: int = 60, queue: str | None = None,
+    ) -> dict[str, int]:
+        cutoff = _now_ts() - seconds
+        async with self._pool.acquire() as conn:
+            if queue:
+                rows = await conn.fetch(
+                    f"""SELECT metric, COUNT(*) AS cnt FROM {self._metrics_table}
+                        WHERE recorded_at > $1 AND queue = $2
+                        GROUP BY metric""",
+                    cutoff, queue,
+                )
+            else:
+                rows = await conn.fetch(
+                    f"""SELECT metric, COUNT(*) AS cnt FROM {self._metrics_table}
+                        WHERE recorded_at > $1
+                        GROUP BY metric""",
+                    cutoff,
+                )
+        out = {"completed": 0, "failed": 0}
+        for r in rows:
+            if r["metric"] in out:
+                out[r["metric"]] = int(r["cnt"])
+        return out

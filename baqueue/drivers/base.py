@@ -73,6 +73,7 @@ class BaseDriver(ABC):
         created_to: float | None = None,
     ) -> list[JobPayload]: ...
 
+    @abstractmethod
     async def count_jobs(
         self,
         queue: str | None = None,
@@ -80,13 +81,9 @@ class BaseDriver(ABC):
         created_from: float | None = None,
         created_to: float | None = None,
     ) -> int:
-        """Count jobs matching filters. Default implementation uses get_jobs."""
-        jobs = await self.get_jobs(
-            queue=queue, status=status,
-            created_from=created_from, created_to=created_to,
-            offset=0, limit=999999,
-        )
-        return len(jobs)
+        """Count jobs matching filters. Drivers MUST implement this efficiently —
+        do not fall back to loading all rows."""
+        ...
 
     @abstractmethod
     async def size(self, queue: str) -> int: ...
@@ -113,6 +110,15 @@ class BaseDriver(ABC):
     @abstractmethod
     async def update_batch(self, batch_id: str, data: dict[str, Any]) -> None: ...
 
+    @abstractmethod
+    async def increment_batch_counter(
+        self, batch_id: str, field: str, delta: int = 1,
+    ) -> dict[str, Any] | None:
+        """Atomically increment data[field] on a batch. Returns the post-increment
+        batch dict, or None if the batch is missing. Implementations MUST be safe
+        against concurrent writers (no read-modify-write in Python)."""
+        ...
+
     # ── Pruning ─────────────────────────────────────────────────
 
     @abstractmethod
@@ -129,4 +135,17 @@ class BaseDriver(ABC):
     @abstractmethod
     async def flush(self, queue: str | None = None) -> None:
         """Remove all jobs (optionally for a specific queue)."""
+        ...
+
+    @abstractmethod
+    async def prune_metrics(self, older_than_seconds: float) -> int:
+        """Delete metric entries older than the cutoff. Returns count pruned."""
+        ...
+
+    @abstractmethod
+    async def recent_throughput(
+        self, seconds: int = 60, queue: str | None = None,
+    ) -> dict[str, int]:
+        """Count completed/failed events recorded in the last `seconds`.
+        Returns a dict like {"completed": N, "failed": N}."""
         ...

@@ -137,6 +137,40 @@
                     </div>
                 </div>
 
+                <!-- Rate Cards (last 60 seconds) -->
+                <div class="metric-cards rates-strip">
+                    <div class="metric-card accent-blue">
+                        <div class="metric-header">
+                            <span class="metric-label">Added / min</span>
+                            <div class="metric-icon pending">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                            </div>
+                        </div>
+                        <div class="metric-value" x-text="formatNumber(rates.added_per_min || 0)"></div>
+                        <div class="metric-sub">jobs dispatched (last 60s)</div>
+                    </div>
+                    <div class="metric-card accent-green">
+                        <div class="metric-header">
+                            <span class="metric-label">Processed / min</span>
+                            <div class="metric-icon completed">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                            </div>
+                        </div>
+                        <div class="metric-value" x-text="formatNumber(rates.processed_per_min || 0)"></div>
+                        <div class="metric-sub">jobs completed (last 60s)</div>
+                    </div>
+                    <div class="metric-card accent-red">
+                        <div class="metric-header">
+                            <span class="metric-label">Failed / min</span>
+                            <div class="metric-icon failed">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                            </div>
+                        </div>
+                        <div class="metric-value" x-text="formatNumber(rates.failed_per_min || 0)"></div>
+                        <div class="metric-sub">jobs failed (last 60s)</div>
+                    </div>
+                </div>
+
                 <!-- Queue Breakdown -->
                 <div class="panel">
                     <div class="panel-header">

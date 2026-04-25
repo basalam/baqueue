@@ -7,6 +7,7 @@ document.addEventListener("alpine:init", () => {
     sidebarCollapsed: false,
 
     totals: { pending: 0, processing: 0, completed: 0, failed: 0, queues: 0, total: 0 },
+    rates: { added_per_min: 0, processed_per_min: 0, failed_per_min: 0 },
     queues: [],
     supervisors: [],
     recentJobs: [],
@@ -126,6 +127,7 @@ document.addEventListener("alpine:init", () => {
             this.totals = data.totals || this.totals;
             this.queues = data.queues || this.queues;
           }
+          if (data.rates) this.rates = data.rates;
           this.supervisors = data.supervisors || this.supervisors;
         };
       } catch (err) {
@@ -165,6 +167,7 @@ document.addEventListener("alpine:init", () => {
           this.totals = data.totals || this.totals;
           this.queues = data.queues || this.queues;
           this.supervisors = data.supervisors || this.supervisors;
+          if (data.rates) this.rates = data.rates;
         }
       } catch (e) { /* ignore */ }
     },

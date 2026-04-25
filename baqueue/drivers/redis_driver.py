@@ -3,22 +3,35 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from baqueue.drivers.base import BaseDriver
 from baqueue.serializer import JobPayload, _now_ts
 
+logger = logging.getLogger("baqueue.redis")
+
 
 class RedisDriver(BaseDriver):
-    """Redis-backed driver using sorted sets for delayed jobs and lists for queues.
+    """Redis-backed driver using sorted sets for indexed pagination.
 
     Key layout (prefix = "baqueue"):
-        baqueue:queue:{name}         - LIST  (pending job ids, FIFO)
-        baqueue:delayed              - ZSET  (job_id scored by delay_until)
-        baqueue:job:{id}             - HASH  (full job payload)
-        baqueue:queues               - SET   (known queue names)
-        baqueue:metrics:{queue}      - LIST  (metric entries)
-        baqueue:batch:{id}           - HASH  (batch metadata)
+        baqueue:queue:{name}                          LIST  pending job ids (FIFO)
+        baqueue:delayed                               ZSET  job_id scored by delay_until
+        baqueue:job:{id}                              HASH  full job payload
+        baqueue:queues                                SET   known queue names
+        baqueue:metrics:{queue}                       LIST  metric entries (capped at 10k)
+        baqueue:batch:{id}                            HASH  batch metadata
+
+        # Secondary indexes scored by created_at — used by get_jobs / count_jobs
+        baqueue:jobs:all                              ZSET  every job
+        baqueue:jobs:queue:{queue}                    ZSET  jobs in a queue
+        baqueue:jobs:status:{status}                  ZSET  jobs in a status
+        baqueue:jobs:queue:{queue}:status:{status}    ZSET  jobs in (queue, status)
+
+    Filtering by tag or batch_id falls back to a per-result scan of the
+    most-specific applicable index — fast for small filtered sets, slow if
+    the input set is huge. Filter by queue/status when possible.
     """
 
     def __init__(self, url: str = "redis://localhost:6379/0", prefix: str = "baqueue", **kwargs: Any):
@@ -30,6 +43,27 @@ class RedisDriver(BaseDriver):
     def _key(self, *parts: str) -> str:
         return ":".join([self._prefix, *parts])
 
+    def _idx_all(self) -> str:
+        return self._key("jobs", "all")
+
+    def _idx_queue(self, queue: str) -> str:
+        return self._key("jobs", "queue", queue)
+
+    def _idx_status(self, status: str) -> str:
+        return self._key("jobs", "status", status)
+
+    def _idx_queue_status(self, queue: str, status: str) -> str:
+        return self._key("jobs", "queue", queue, "status", status)
+
+    def _index_key(self, queue: str | None, status: str | None) -> str:
+        if queue and status:
+            return self._idx_queue_status(queue, status)
+        if queue:
+            return self._idx_queue(queue)
+        if status:
+            return self._idx_status(status)
+        return self._idx_all()
+
     async def connect(self) -> None:
         try:
             import redis.asyncio as aioredis
@@ -40,11 +74,66 @@ class RedisDriver(BaseDriver):
             ) from None
         self._redis = aioredis.from_url(self._url, decode_responses=True, **self._kwargs)
         await self._redis.ping()
+        await self._backfill_indexes_if_needed()
 
     async def disconnect(self) -> None:
         if self._redis:
             await self._redis.aclose()
             self._redis = None
+
+    async def _backfill_indexes_if_needed(self) -> None:
+        """One-time rebuild of secondary ZSETs for upgrades from a version
+        that didn't maintain them. Safe to call on every connect — exits fast
+        when the global index is non-empty."""
+        if await self._redis.exists(self._idx_all()):
+            return
+        cursor: Any = "0"
+        pattern = self._key("job", "*")
+        backfilled = 0
+        while True:
+            cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=500)
+            if keys:
+                pipe = self._redis.pipeline()
+                for key in keys:
+                    pipe.hget(key, "data")
+                raws = await pipe.execute()
+                pipe = self._redis.pipeline()
+                for raw in raws:
+                    if not raw:
+                        continue
+                    job = JobPayload.from_json(raw)
+                    self._index_add(pipe, job)
+                    backfilled += 1
+                await pipe.execute()
+            if cursor == "0" or cursor == 0:
+                break
+        if backfilled:
+            logger.info("Backfilled %d job(s) into Redis secondary indexes", backfilled)
+
+    # ── Index maintenance ──────────────────────────────────────
+
+    def _index_add(self, pipe: Any, job: JobPayload) -> None:
+        score = job.created_at
+        pipe.zadd(self._idx_all(), {job.id: score})
+        pipe.zadd(self._idx_queue(job.queue), {job.id: score})
+        pipe.zadd(self._idx_status(job.status), {job.id: score})
+        pipe.zadd(self._idx_queue_status(job.queue, job.status), {job.id: score})
+
+    def _index_remove(self, pipe: Any, job_id: str, queue: str, status: str) -> None:
+        pipe.zrem(self._idx_all(), job_id)
+        pipe.zrem(self._idx_queue(queue), job_id)
+        pipe.zrem(self._idx_status(status), job_id)
+        pipe.zrem(self._idx_queue_status(queue, status), job_id)
+
+    def _index_status_change(
+        self, pipe: Any, job_id: str, queue: str, old_status: str, new_status: str, score: float,
+    ) -> None:
+        if old_status == new_status:
+            return
+        pipe.zrem(self._idx_status(old_status), job_id)
+        pipe.zrem(self._idx_queue_status(queue, old_status), job_id)
+        pipe.zadd(self._idx_status(new_status), {job_id: score})
+        pipe.zadd(self._idx_queue_status(queue, new_status), {job_id: score})
 
     # ── Push / Pop ──────────────────────────────────────────────
 
@@ -60,6 +149,7 @@ class RedisDriver(BaseDriver):
         else:
             pipe.rpush(self._key("queue", payload.queue), payload.id)
 
+        self._index_add(pipe, payload)
         await pipe.execute()
         return payload.id
 
@@ -76,6 +166,7 @@ class RedisDriver(BaseDriver):
                 pipe.zadd(self._key("delayed"), {p.id: p.delay_until})
             else:
                 pipe.rpush(self._key("queue", p.queue), p.id)
+            self._index_add(pipe, p)
             ids.append(p.id)
         await pipe.execute()
         return ids
@@ -88,11 +179,17 @@ class RedisDriver(BaseDriver):
         if not raw:
             return None
         payload = JobPayload.from_json(raw)
+        old_status = payload.status
         payload.status = "processing"
-        payload.started_at = _now_ts()
-        payload.updated_at = _now_ts()
+        now = _now_ts()
+        payload.started_at = now
+        payload.updated_at = now
         payload.attempts += 1
-        await self._redis.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+
+        pipe = self._redis.pipeline()
+        pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+        self._index_status_change(pipe, payload.id, payload.queue, old_status, payload.status, payload.created_at)
+        await pipe.execute()
         return payload
 
     async def pop_delayed(self) -> list[JobPayload]:
@@ -101,62 +198,93 @@ class RedisDriver(BaseDriver):
         if not job_ids:
             return []
 
-        moved: list[JobPayload] = []
         pipe = self._redis.pipeline()
         for job_id in job_ids:
             pipe.zrem(self._key("delayed"), job_id)
         await pipe.execute()
 
+        moved: list[JobPayload] = []
         for job_id in job_ids:
             raw = await self._redis.hget(self._key("job", job_id), "data")
             if raw:
                 payload = JobPayload.from_json(raw)
                 payload.delay_until = None
                 payload.updated_at = _now_ts()
-                await self._redis.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
-                await self._redis.rpush(self._key("queue", payload.queue), payload.id)
+                pipe = self._redis.pipeline()
+                pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+                pipe.rpush(self._key("queue", payload.queue), payload.id)
+                await pipe.execute()
                 moved.append(payload)
         return moved
 
     # ── Job lifecycle ───────────────────────────────────────────
 
-    async def complete(self, payload: JobPayload) -> None:
-        payload.status = "completed"
-        payload.completed_at = _now_ts()
+    async def _transition(self, payload: JobPayload, new_status: str) -> None:
+        old_status = payload.status
+        payload.status = new_status
         payload.updated_at = _now_ts()
-        await self._redis.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+        pipe = self._redis.pipeline()
+        pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+        self._index_status_change(pipe, payload.id, payload.queue, old_status, new_status, payload.created_at)
+        await pipe.execute()
+
+    async def complete(self, payload: JobPayload) -> None:
+        payload.completed_at = _now_ts()
+        await self._transition(payload, "completed")
 
     async def fail(self, payload: JobPayload, error: str) -> None:
-        payload.status = "failed"
         payload.failed_at = _now_ts()
-        payload.updated_at = _now_ts()
         payload.error = error
-        await self._redis.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+        await self._transition(payload, "failed")
 
     async def release(self, payload: JobPayload, delay: float = 0) -> None:
+        old_status = payload.status
         payload.status = "pending"
         payload.updated_at = _now_ts()
+
+        pipe = self._redis.pipeline()
         if delay > 0:
             payload.delay_until = _now_ts() + delay
-            await self._redis.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
-            await self._redis.zadd(self._key("delayed"), {payload.id: payload.delay_until})
+            pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+            pipe.zadd(self._key("delayed"), {payload.id: payload.delay_until})
         else:
-            await self._redis.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
-            await self._redis.rpush(self._key("queue", payload.queue), payload.id)
+            pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
+            pipe.rpush(self._key("queue", payload.queue), payload.id)
+        self._index_status_change(pipe, payload.id, payload.queue, old_status, "pending", payload.created_at)
+        await pipe.execute()
 
     async def delete(self, job_id: str) -> None:
         raw = await self._redis.hget(self._key("job", job_id), "data")
+        pipe = self._redis.pipeline()
         if raw:
             payload = JobPayload.from_json(raw)
-            await self._redis.lrem(self._key("queue", payload.queue), 0, job_id)
-        await self._redis.zrem(self._key("delayed"), job_id)
-        await self._redis.delete(self._key("job", job_id))
+            pipe.lrem(self._key("queue", payload.queue), 0, job_id)
+            self._index_remove(pipe, job_id, payload.queue, payload.status)
+        pipe.zrem(self._key("delayed"), job_id)
+        pipe.delete(self._key("job", job_id))
+        await pipe.execute()
 
     # ── Query ───────────────────────────────────────────────────
 
     async def get_job(self, job_id: str) -> JobPayload | None:
         raw = await self._redis.hget(self._key("job", job_id), "data")
         return JobPayload.from_json(raw) if raw else None
+
+    async def _ids_from_index(
+        self,
+        index: str,
+        offset: int,
+        limit: int,
+        created_from: float | None,
+        created_to: float | None,
+    ) -> list[str]:
+        if created_from is None and created_to is None:
+            return await self._redis.zrevrange(index, offset, offset + limit - 1)
+        max_score: float | str = "+inf" if created_to is None else created_to
+        min_score: float | str = "-inf" if created_from is None else created_from
+        return await self._redis.zrevrangebyscore(
+            index, max_score, min_score, start=offset, num=limit,
+        )
 
     async def get_jobs(
         self,
@@ -169,35 +297,53 @@ class RedisDriver(BaseDriver):
         created_from: float | None = None,
         created_to: float | None = None,
     ) -> list[JobPayload]:
-        cursor = "0"
+        index = self._index_key(queue, status)
+
+        # When tag/batch_id filtering is needed we have to over-fetch and post-filter.
+        # Cap the over-fetch to avoid pathological cases.
+        needs_post_filter = bool(tag or batch_id)
+        fetch_offset = 0 if needs_post_filter else offset
+        fetch_limit = max(limit * 10, 200) if needs_post_filter else limit
+
+        ids = await self._ids_from_index(
+            index, fetch_offset, fetch_limit, created_from, created_to,
+        )
+        if not ids:
+            return []
+
+        pipe = self._redis.pipeline()
+        for jid in ids:
+            pipe.hget(self._key("job", jid), "data")
+        raws = await pipe.execute()
+
         results: list[JobPayload] = []
-        pattern = self._key("job", "*")
+        for raw in raws:
+            if not raw:
+                continue
+            job = JobPayload.from_json(raw)
+            if tag and tag not in job.tags:
+                continue
+            if batch_id and job.batch_id != batch_id:
+                continue
+            results.append(job)
 
-        while True:
-            cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=200)
-            for key in keys:
-                raw = await self._redis.hget(key, "data")
-                if not raw:
-                    continue
-                job = JobPayload.from_json(raw)
-                if queue and job.queue != queue:
-                    continue
-                if status and job.status != status:
-                    continue
-                if tag and tag not in job.tags:
-                    continue
-                if batch_id and job.batch_id != batch_id:
-                    continue
-                if created_from is not None and job.created_at < created_from:
-                    continue
-                if created_to is not None and job.created_at > created_to:
-                    continue
-                results.append(job)
-            if cursor == "0" or cursor == 0:
-                break
+        if needs_post_filter:
+            results = results[offset : offset + limit]
+        return results
 
-        results.sort(key=lambda j: j.created_at, reverse=True)
-        return results[offset : offset + limit]
+    async def count_jobs(
+        self,
+        queue: str | None = None,
+        status: str | None = None,
+        created_from: float | None = None,
+        created_to: float | None = None,
+    ) -> int:
+        index = self._index_key(queue, status)
+        if created_from is None and created_to is None:
+            return int(await self._redis.zcard(index))
+        min_score = "-inf" if created_from is None else created_from
+        max_score = "+inf" if created_to is None else created_to
+        return int(await self._redis.zcount(index, min_score, max_score))
 
     async def size(self, queue: str) -> int:
         return await self._redis.llen(self._key("queue", queue))
@@ -225,10 +371,11 @@ class RedisDriver(BaseDriver):
             entries = [json.loads(e) for e in entries_raw]
             completed = sum(1 for e in entries if e["metric"] == "completed")
             failed = sum(1 for e in entries if e["metric"] == "failed")
-            pending = await self.size(q)
+            pending = await self._redis.zcard(self._idx_queue_status(q, "pending"))
+            processing = await self._redis.zcard(self._idx_queue_status(q, "processing"))
             result[q] = {
-                "pending": pending,
-                "processing": 0,
+                "pending": int(pending),
+                "processing": int(processing),
                 "completed": completed,
                 "failed": failed,
             }
@@ -246,6 +393,29 @@ class RedisDriver(BaseDriver):
     async def update_batch(self, batch_id: str, data: dict[str, Any]) -> None:
         await self._redis.hset(self._key("batch", batch_id), mapping={"data": json.dumps(data)})
 
+    # Lua: atomically read the batch JSON, bump one numeric field, write back.
+    # KEYS[1] = batch hash key, ARGV[1] = field, ARGV[2] = delta (int as string).
+    _BATCH_INCR_LUA = """
+        local raw = redis.call('HGET', KEYS[1], 'data')
+        if not raw then return nil end
+        local data = cjson.decode(raw)
+        local delta = tonumber(ARGV[2]) or 0
+        data[ARGV[1]] = (tonumber(data[ARGV[1]]) or 0) + delta
+        local out = cjson.encode(data)
+        redis.call('HSET', KEYS[1], 'data', out)
+        return out
+    """
+
+    async def increment_batch_counter(
+        self, batch_id: str, field: str, delta: int = 1,
+    ) -> dict[str, Any] | None:
+        raw = await self._redis.eval(
+            self._BATCH_INCR_LUA, 1, self._key("batch", batch_id), field, str(delta),
+        )
+        if raw is None:
+            return None
+        return json.loads(raw)
+
     # ── Pruning ─────────────────────────────────────────────────
 
     async def prune(
@@ -255,50 +425,88 @@ class RedisDriver(BaseDriver):
         older_than_seconds: float | None = None,
         queue: str | None = None,
     ) -> int:
-        now = _now_ts()
-        pruned = 0
-        cursor = "0"
-        pattern = self._key("job", "*")
+        if not (status or tag or older_than_seconds or queue):
+            return 0
 
-        while True:
-            cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=200)
-            for key in keys:
-                raw = await self._redis.hget(key, "data")
-                if not raw:
+        index = self._index_key(queue, status)
+        candidate_ids: list[str] = await self._redis.zrange(index, 0, -1)
+        if not candidate_ids:
+            return 0
+
+        pipe = self._redis.pipeline()
+        for jid in candidate_ids:
+            pipe.hget(self._key("job", jid), "data")
+        raws = await pipe.execute()
+
+        now = _now_ts()
+        to_delete: list[JobPayload] = []
+        for raw in raws:
+            if not raw:
+                continue
+            job = JobPayload.from_json(raw)
+            if tag and tag not in job.tags:
+                continue
+            if older_than_seconds and (now - job.updated_at) < older_than_seconds:
+                continue
+            to_delete.append(job)
+
+        if not to_delete:
+            return 0
+
+        pipe = self._redis.pipeline()
+        for job in to_delete:
+            pipe.lrem(self._key("queue", job.queue), 0, job.id)
+            pipe.zrem(self._key("delayed"), job.id)
+            pipe.delete(self._key("job", job.id))
+            self._index_remove(pipe, job.id, job.queue, job.status)
+        await pipe.execute()
+        return len(to_delete)
+
+    async def prune_metrics(self, older_than_seconds: float) -> int:
+        # The metrics LIST is already capped at 10k entries via LTRIM in
+        # record_metric, so no pruning is needed beyond what's already happening.
+        return 0
+
+    async def recent_throughput(
+        self, seconds: int = 60, queue: str | None = None,
+    ) -> dict[str, int]:
+        cutoff = _now_ts() - seconds
+        out = {"completed": 0, "failed": 0}
+        queue_names = [queue] if queue else await self.queues()
+        for q in queue_names:
+            entries_raw = await self._redis.lrange(self._key("metrics", q), 0, -1)
+            for raw in entries_raw:
+                try:
+                    e = json.loads(raw)
+                except (ValueError, TypeError):
                     continue
-                job = JobPayload.from_json(raw)
-                if queue and job.queue != queue:
+                if e.get("time", 0) < cutoff:
                     continue
-                if status and job.status != status:
-                    continue
-                if tag and tag not in job.tags:
-                    continue
-                if older_than_seconds and (now - job.updated_at) < older_than_seconds:
-                    continue
-                await self.delete(job.id)
-                pruned += 1
-            if cursor == "0" or cursor == 0:
-                break
-        return pruned
+                m = e.get("metric")
+                if m in out:
+                    out[m] += 1
+        return out
 
     async def flush(self, queue: str | None = None) -> None:
         if queue:
             await self._redis.delete(self._key("queue", queue))
-            cursor = "0"
-            pattern = self._key("job", "*")
-            while True:
-                cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=200)
-                for key in keys:
-                    raw = await self._redis.hget(key, "data")
-                    if raw:
-                        job = JobPayload.from_json(raw)
-                        if job.queue == queue:
-                            await self._redis.delete(key)
-                if cursor == "0" or cursor == 0:
-                    break
+            ids = await self._redis.zrange(self._idx_queue(queue), 0, -1)
+            if ids:
+                pipe = self._redis.pipeline()
+                for jid in ids:
+                    pipe.delete(self._key("job", jid))
+                    pipe.zrem(self._idx_all(), jid)
+                    pipe.zrem(self._key("delayed"), jid)
+                await pipe.execute()
+            # Drop all per-queue and per-(queue,status) indexes
+            pipe = self._redis.pipeline()
+            pipe.delete(self._idx_queue(queue))
+            for st in ("pending", "processing", "completed", "failed"):
+                pipe.delete(self._idx_queue_status(queue, st))
+            await pipe.execute()
             await self._redis.srem(self._key("queues"), queue)
         else:
-            cursor = "0"
+            cursor: Any = "0"
             while True:
                 cursor, keys = await self._redis.scan(cursor=cursor, match=f"{self._prefix}:*", count=200)
                 if keys:

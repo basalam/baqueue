@@ -54,9 +54,15 @@ class Pruner:
             )
             results["cancelled"] = count
 
+        if self.config.prune_metrics_hours > 0:
+            count = await self.driver.prune_metrics(
+                older_than_seconds=self.config.prune_metrics_hours * 3600,
+            )
+            results["metrics"] = count
+
         total = sum(results.values())
         if total > 0:
-            logger.info("Pruned %d jobs: %s", total, results)
+            logger.info("Pruned %d entries: %s", total, results)
             self.events.emit_nowait("queue.pruned", results=results)
 
         return results

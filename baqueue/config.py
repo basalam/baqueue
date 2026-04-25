@@ -55,6 +55,7 @@ class BaQueueConfig(BaseModel):
     prune_completed_hours: int = 24
     prune_failed_hours: int = 168  # 7 days
     prune_cancelled_hours: int = 24
+    prune_metrics_hours: int = 168  # 7 days
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BaQueueConfig:

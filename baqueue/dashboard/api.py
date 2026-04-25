@@ -48,6 +48,10 @@ class DashboardAPI:
                 "failed": failed,
             })
 
+        now = _now_ts()
+        dispatch_rate = await self.driver.count_jobs(created_from=now - 60)
+        throughput = await self.driver.recent_throughput(seconds=60)
+
         return {
             "totals": {
                 "pending": total_pending,
@@ -57,9 +61,14 @@ class DashboardAPI:
                 "queues": len(queues),
                 "total": total_pending + total_processing + total_completed + total_failed,
             },
+            "rates": {
+                "added_per_min": dispatch_rate,
+                "processed_per_min": throughput.get("completed", 0),
+                "failed_per_min": throughput.get("failed", 0),
+            },
             "queues": queue_details,
             "supervisors": self._supervisor_stats,
-            "timestamp": _now_ts(),
+            "timestamp": now,
         }
 
     async def queue_detail(self, queue: str) -> dict[str, Any]:

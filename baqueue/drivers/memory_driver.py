@@ -147,6 +147,26 @@ class MemoryDriver(BaseDriver):
         results.sort(key=lambda j: j.created_at, reverse=True)
         return results[offset : offset + limit]
 
+    async def count_jobs(
+        self,
+        queue: str | None = None,
+        status: str | None = None,
+        created_from: float | None = None,
+        created_to: float | None = None,
+    ) -> int:
+        n = 0
+        for j in self._jobs.values():
+            if queue and j.queue != queue:
+                continue
+            if status and j.status != status:
+                continue
+            if created_from is not None and j.created_at < created_from:
+                continue
+            if created_to is not None and j.created_at > created_to:
+                continue
+            n += 1
+        return n
+
     async def size(self, queue: str) -> int:
         return len(self._queues.get(queue, []))
 
@@ -194,6 +214,16 @@ class MemoryDriver(BaseDriver):
         if batch_id in self._batches:
             self._batches[batch_id].update(data)
 
+    async def increment_batch_counter(
+        self, batch_id: str, field: str, delta: int = 1,
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            batch = self._batches.get(batch_id)
+            if batch is None:
+                return None
+            batch[field] = batch.get(field, 0) + delta
+            return dict(batch)
+
     # ── Pruning ─────────────────────────────────────────────────
 
     async def prune(
@@ -218,6 +248,31 @@ class MemoryDriver(BaseDriver):
         for job_id in to_delete:
             await self.delete(job_id)
         return len(to_delete)
+
+    async def prune_metrics(self, older_than_seconds: float) -> int:
+        cutoff = _now_ts() - older_than_seconds
+        removed = 0
+        async with self._lock:
+            for q, entries in list(self._metrics.items()):
+                kept = [e for e in entries if e.get("time", 0) >= cutoff]
+                removed += len(entries) - len(kept)
+                self._metrics[q] = kept
+        return removed
+
+    async def recent_throughput(
+        self, seconds: int = 60, queue: str | None = None,
+    ) -> dict[str, int]:
+        cutoff = _now_ts() - seconds
+        result = {"completed": 0, "failed": 0}
+        queues = [queue] if queue else list(self._metrics.keys())
+        for q in queues:
+            for e in self._metrics.get(q, []):
+                if e.get("time", 0) < cutoff:
+                    continue
+                m = e.get("metric")
+                if m in result:
+                    result[m] += 1
+        return result
 
     async def flush(self, queue: str | None = None) -> None:
         if queue:

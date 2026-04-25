@@ -144,21 +144,21 @@ class Worker:
     async def _check_batch_completion(self, payload: JobPayload) -> None:
         if not payload.batch_id:
             return
-        batch = await self.driver.get_batch(payload.batch_id)
+        batch = await self.driver.increment_batch_counter(payload.batch_id, "completed_count", 1)
         if not batch:
             return
-        batch["completed_count"] = batch.get("completed_count", 0) + 1
-        await self.driver.update_batch(payload.batch_id, batch)
-        if batch["completed_count"] + batch.get("failed_count", 0) >= batch.get("total", 0):
+        done = batch.get("completed_count", 0) + batch.get("failed_count", 0)
+        # Equality, not >=, so only the worker that pushed `done` to total fires the event.
+        if done == batch.get("total", 0):
             await self.events.emit("batch.completed", batch_id=payload.batch_id, batch=batch)
 
     async def _check_batch_failure(self, payload: JobPayload) -> None:
         if not payload.batch_id:
             return
-        batch = await self.driver.get_batch(payload.batch_id)
+        batch = await self.driver.increment_batch_counter(payload.batch_id, "failed_count", 1)
         if not batch:
             return
-        batch["failed_count"] = batch.get("failed_count", 0) + 1
-        await self.driver.update_batch(payload.batch_id, batch)
-        if batch.get("allow_failures", False) is False and batch["failed_count"] == 1:
+        # Fire batch.failed exactly once on the first failure (the increment that
+        # transitioned failed_count from 0 to 1).
+        if batch.get("allow_failures", False) is False and batch.get("failed_count", 0) == 1:
             await self.events.emit("batch.failed", batch_id=payload.batch_id, batch=batch)

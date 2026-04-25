@@ -51,10 +51,11 @@ class SqliteDriver(BaseDriver):
             self._conn = None
 
     async def _execute_with_retry(self, fn):
-        """Execute a database operation with retry on 'database is locked'."""
+        """Execute a database operation with retry on 'database is locked'.
+        Runs the sync sqlite call in a thread so the asyncio loop is never blocked."""
         for attempt in range(MAX_RETRIES):
             try:
-                return fn()
+                return await asyncio.to_thread(fn)
             except sqlite3.OperationalError as e:
                 if "locked" in str(e) and attempt < MAX_RETRIES - 1:
                     delay = RETRY_BASE_DELAY * (2 ** attempt)
@@ -62,6 +63,10 @@ class SqliteDriver(BaseDriver):
                     await asyncio.sleep(delay)
                 else:
                     raise
+
+    async def _run(self, fn):
+        """Run a sync read-only sqlite call off the event loop."""
+        return await asyncio.to_thread(fn)
 
     def _ensure_tables(self) -> None:
         c = self._get_conn()
@@ -86,9 +91,13 @@ class SqliteDriver(BaseDriver):
                 completed_at REAL,
                 failed_at REAL
             );
-            CREATE INDEX IF NOT EXISTS idx_jobs_queue_status ON jobs (queue, status);
+            CREATE INDEX IF NOT EXISTS idx_jobs_queue_status_created
+                ON jobs (queue, status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs (created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs (status, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_jobs_delay ON jobs (delay_until) WHERE delay_until IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs (batch_id) WHERE batch_id IS NOT NULL;
+            DROP INDEX IF EXISTS idx_jobs_queue_status;
 
             CREATE TABLE IF NOT EXISTS batches (
                 id TEXT PRIMARY KEY,
@@ -102,6 +111,8 @@ class SqliteDriver(BaseDriver):
                 value REAL NOT NULL,
                 recorded_at REAL NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_metrics_queue_metric ON metrics (queue, metric);
+            CREATE INDEX IF NOT EXISTS idx_metrics_recorded_at ON metrics (recorded_at);
         """)
 
     def _row_to_payload(self, row: sqlite3.Row) -> JobPayload:
@@ -189,29 +200,38 @@ class SqliteDriver(BaseDriver):
     async def pop(self, queue: str) -> JobPayload | None:
         now = _now_ts()
         async with self._lock:
-            result = [None]
+            result: list[JobPayload | None] = [None]
             def _do():
                 c = self._get_conn()
-                row = c.execute(
-                    """SELECT * FROM jobs
-                       WHERE queue=? AND status='pending'
-                         AND (delay_until IS NULL OR delay_until <= ?)
-                       ORDER BY created_at ASC LIMIT 1""",
-                    (queue, now),
-                ).fetchone()
-                if not row:
-                    return
-                c.execute(
-                    "UPDATE jobs SET status='processing', started_at=?, updated_at=?, attempts=attempts+1 WHERE id=?",
-                    (now, now, row["id"]),
-                )
-                c.commit()
-                payload = self._row_to_payload(row)
-                payload.status = "processing"
-                payload.started_at = now
-                payload.updated_at = now
-                payload.attempts += 1
-                result[0] = payload
+                # Atomic claim: SELECT then UPDATE … WHERE status='pending' guards
+                # against another process having grabbed the row between the two
+                # statements. Bounded retry so we don't livelock under contention.
+                for _ in range(5):
+                    row = c.execute(
+                        """SELECT * FROM jobs
+                           WHERE queue=? AND status='pending'
+                             AND (delay_until IS NULL OR delay_until <= ?)
+                           ORDER BY created_at ASC LIMIT 1""",
+                        (queue, now),
+                    ).fetchone()
+                    if not row:
+                        c.commit()
+                        return
+                    cur = c.execute(
+                        """UPDATE jobs
+                           SET status='processing', started_at=?, updated_at=?, attempts=attempts+1
+                           WHERE id=? AND status='pending'""",
+                        (now, now, row["id"]),
+                    )
+                    c.commit()
+                    if cur.rowcount == 1:
+                        payload = self._row_to_payload(row)
+                        payload.status = "processing"
+                        payload.started_at = now
+                        payload.updated_at = now
+                        payload.attempts += 1
+                        result[0] = payload
+                        return
             await self._execute_with_retry(_do)
             return result[0]
 
@@ -290,7 +310,9 @@ class SqliteDriver(BaseDriver):
     # ── Query ───────────────────────────────────────────────────
 
     async def get_job(self, job_id: str) -> JobPayload | None:
-        row = self._get_conn().execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        def _do():
+            return self._get_conn().execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        row = await self._run(_do)
         return self._row_to_payload(row) if row else None
 
     def _build_where(
@@ -338,10 +360,12 @@ class SqliteDriver(BaseDriver):
     ) -> list[JobPayload]:
         where, params = self._build_where(queue, status, tag, batch_id, created_from, created_to)
         params.extend([limit, offset])
-        rows = self._get_conn().execute(
-            f"SELECT * FROM jobs WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            params,
-        ).fetchall()
+        def _do():
+            return self._get_conn().execute(
+                f"SELECT * FROM jobs WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        rows = await self._run(_do)
         return [self._row_to_payload(r) for r in rows]
 
     async def count_jobs(
@@ -352,20 +376,28 @@ class SqliteDriver(BaseDriver):
         created_to: float | None = None,
     ) -> int:
         where, params = self._build_where(queue=queue, status=status, created_from=created_from, created_to=created_to)
-        row = self._get_conn().execute(
-            f"SELECT COUNT(*) as cnt FROM jobs WHERE {where}", params,
-        ).fetchone()
+        def _do():
+            return self._get_conn().execute(
+                f"SELECT COUNT(*) as cnt FROM jobs WHERE {where}", params,
+            ).fetchone()
+        row = await self._run(_do)
         return row["cnt"] if row else 0
 
     async def size(self, queue: str) -> int:
-        row = self._get_conn().execute(
-            "SELECT COUNT(*) as cnt FROM jobs WHERE queue=? AND status='pending'",
-            (queue,),
-        ).fetchone()
+        def _do():
+            return self._get_conn().execute(
+                "SELECT COUNT(*) as cnt FROM jobs WHERE queue=? AND status='pending'",
+                (queue,),
+            ).fetchone()
+        row = await self._run(_do)
         return row["cnt"] if row else 0
 
     async def queues(self) -> list[str]:
-        rows = self._get_conn().execute("SELECT DISTINCT queue FROM jobs ORDER BY queue").fetchall()
+        def _do():
+            return self._get_conn().execute(
+                "SELECT DISTINCT queue FROM jobs ORDER BY queue"
+            ).fetchall()
+        rows = await self._run(_do)
         return [r["queue"] for r in rows]
 
     # ── Metrics ─────────────────────────────────────────────────
@@ -381,34 +413,46 @@ class SqliteDriver(BaseDriver):
             await self._execute_with_retry(_do)
 
     async def get_metrics(self, queue: str | None = None) -> dict[str, Any]:
-        if queue:
-            rows = self._get_conn().execute(
-                "SELECT queue, metric, COUNT(*) as cnt FROM metrics WHERE queue=? GROUP BY queue, metric",
-                (queue,),
-            ).fetchall()
-        else:
-            rows = self._get_conn().execute(
-                "SELECT queue, metric, COUNT(*) as cnt FROM metrics GROUP BY queue, metric"
-            ).fetchall()
+        def _do() -> dict[str, Any]:
+            c = self._get_conn()
+            if queue:
+                metric_rows = c.execute(
+                    "SELECT queue, metric, COUNT(*) as cnt FROM metrics WHERE queue=? GROUP BY queue, metric",
+                    (queue,),
+                ).fetchall()
+                queue_rows = [{"queue": queue}]
+            else:
+                metric_rows = c.execute(
+                    "SELECT queue, metric, COUNT(*) as cnt FROM metrics GROUP BY queue, metric"
+                ).fetchall()
+                queue_rows = c.execute(
+                    "SELECT DISTINCT queue FROM jobs ORDER BY queue"
+                ).fetchall()
 
-        result: dict[str, Any] = {}
-        for r in rows:
-            q = r["queue"]
-            if q not in result:
-                result[q] = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
-            result[q][r["metric"]] = r["cnt"]
+            result: dict[str, Any] = {}
+            for r in metric_rows:
+                q = r["queue"]
+                if q not in result:
+                    result[q] = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+                result[q][r["metric"]] = r["cnt"]
 
-        all_queues = await self.queues()
-        for q in all_queues:
-            if q not in result:
-                result[q] = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
-            result[q]["pending"] = await self.size(q)
-            processing = self._get_conn().execute(
-                "SELECT COUNT(*) as cnt FROM jobs WHERE queue=? AND status='processing'", (q,),
-            ).fetchone()
-            result[q]["processing"] = processing["cnt"] if processing else 0
+            for qr in queue_rows:
+                q = qr["queue"]
+                if q not in result:
+                    result[q] = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+                state_row = c.execute(
+                    """SELECT
+                           SUM(CASE WHEN status='pending'    THEN 1 ELSE 0 END) AS pending,
+                           SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) AS processing
+                       FROM jobs WHERE queue=?""",
+                    (q,),
+                ).fetchone()
+                result[q]["pending"] = state_row["pending"] or 0
+                result[q]["processing"] = state_row["processing"] or 0
 
-        return result
+            return result
+
+        return await self._run(_do)
 
     # ── Batch helpers ───────────────────────────────────────────
 
@@ -422,7 +466,11 @@ class SqliteDriver(BaseDriver):
             await self._execute_with_retry(_do)
 
     async def get_batch(self, batch_id: str) -> dict[str, Any] | None:
-        row = self._get_conn().execute("SELECT data FROM batches WHERE id=?", (batch_id,)).fetchone()
+        def _do():
+            return self._get_conn().execute(
+                "SELECT data FROM batches WHERE id=?", (batch_id,)
+            ).fetchone()
+        row = await self._run(_do)
         if row:
             return json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
         return None
@@ -435,6 +483,32 @@ class SqliteDriver(BaseDriver):
                 c.execute("UPDATE batches SET data=? WHERE id=?", (json_data, batch_id))
                 c.commit()
             await self._execute_with_retry(_do)
+
+    async def increment_batch_counter(
+        self, batch_id: str, field: str, delta: int = 1,
+    ) -> dict[str, Any] | None:
+        path = f"$.{field}"
+        result: list[dict[str, Any] | None] = [None]
+        async with self._lock:
+            def _do():
+                c = self._get_conn()
+                c.execute(
+                    """UPDATE batches
+                       SET data = json_set(
+                           data, ?,
+                           COALESCE(json_extract(data, ?), 0) + ?
+                       )
+                       WHERE id = ?""",
+                    (path, path, delta, batch_id),
+                )
+                c.commit()
+                row = c.execute("SELECT data FROM batches WHERE id=?", (batch_id,)).fetchone()
+                if row is None:
+                    return
+                raw = row["data"]
+                result[0] = json.loads(raw) if isinstance(raw, str) else raw
+            await self._execute_with_retry(_do)
+        return result[0]
 
     # ── Pruning ─────────────────────────────────────────────────
 
@@ -486,3 +560,42 @@ class SqliteDriver(BaseDriver):
                     c.executescript("DELETE FROM jobs; DELETE FROM batches; DELETE FROM metrics;")
                 c.commit()
             await self._execute_with_retry(_do)
+
+    async def prune_metrics(self, older_than_seconds: float) -> int:
+        cutoff = _now_ts() - older_than_seconds
+        result = [0]
+        async with self._lock:
+            def _do():
+                c = self._get_conn()
+                cur = c.execute("DELETE FROM metrics WHERE recorded_at < ?", (cutoff,))
+                c.commit()
+                result[0] = cur.rowcount
+            await self._execute_with_retry(_do)
+        return result[0]
+
+    async def recent_throughput(
+        self, seconds: int = 60, queue: str | None = None,
+    ) -> dict[str, int]:
+        cutoff = _now_ts() - seconds
+        def _do() -> dict[str, int]:
+            c = self._get_conn()
+            if queue:
+                rows = c.execute(
+                    """SELECT metric, COUNT(*) AS cnt FROM metrics
+                       WHERE recorded_at > ? AND queue = ?
+                       GROUP BY metric""",
+                    (cutoff, queue),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    """SELECT metric, COUNT(*) AS cnt FROM metrics
+                       WHERE recorded_at > ?
+                       GROUP BY metric""",
+                    (cutoff,),
+                ).fetchall()
+            out = {"completed": 0, "failed": 0}
+            for r in rows:
+                if r["metric"] in out:
+                    out[r["metric"]] = r["cnt"]
+            return out
+        return await self._run(_do)

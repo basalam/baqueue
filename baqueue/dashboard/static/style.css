@@ -348,6 +348,10 @@ body {
     margin-bottom: 24px;
 }
 
+.metric-cards.rates-strip {
+    grid-template-columns: repeat(3, 1fr);
+}
+
 .metric-card {
     background: var(--bg-surface);
     border: 1px solid var(--border);
