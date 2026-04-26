@@ -9,3 +9,5 @@ build/
 *.db-journal
 *.db-wal
 *.db-shm
+
+/.claude
