@@ -21,6 +21,8 @@ class DashboardAPI:
     async def overview(self) -> dict[str, Any]:
         queues = await self.driver.queues()
         metrics = await self.driver.get_metrics()
+        now = _now_ts()
+        rate_window_from = now - 60
 
         total_pending = 0
         total_processing = 0
@@ -40,16 +42,24 @@ class DashboardAPI:
             total_completed += completed
             total_failed += failed
 
+            q_pending_rate = await self.driver.count_jobs(queue=q, created_from=rate_window_from)
+            q_throughput = await self.driver.recent_throughput(seconds=60, queue=q)
+
             queue_details.append({
                 "name": q,
                 "pending": pending,
                 "processing": processing,
                 "completed": completed,
                 "failed": failed,
+                "rates": {
+                    "pending_per_min": q_pending_rate,
+                    "processing_per_min": q_throughput.get("processing", 0),
+                    "completed_per_min": q_throughput.get("completed", 0),
+                    "failed_per_min": q_throughput.get("failed", 0),
+                },
             })
 
-        now = _now_ts()
-        dispatch_rate = await self.driver.count_jobs(created_from=now - 60)
+        dispatch_rate = await self.driver.count_jobs(created_from=rate_window_from)
         throughput = await self.driver.recent_throughput(seconds=60)
 
         return {
@@ -62,8 +72,9 @@ class DashboardAPI:
                 "total": total_pending + total_processing + total_completed + total_failed,
             },
             "rates": {
-                "added_per_min": dispatch_rate,
-                "processed_per_min": throughput.get("completed", 0),
+                "pending_per_min": dispatch_rate,
+                "processing_per_min": throughput.get("processing", 0),
+                "completed_per_min": throughput.get("completed", 0),
                 "failed_per_min": throughput.get("failed", 0),
             },
             "queues": queue_details,

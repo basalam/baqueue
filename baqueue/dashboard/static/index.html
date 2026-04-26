@@ -103,6 +103,7 @@
                             </div>
                         </div>
                         <div class="metric-value" x-text="formatNumber(totals.pending)"></div>
+                        <div class="metric-sub" x-text="'+' + formatNumber(rates.pending_per_min || 0) + ' / min'"></div>
                         <div class="metric-bar"><div class="metric-bar-fill pending" :style="'width:' + pctOf(totals.pending, totals.total)"></div></div>
                     </div>
                     <div class="metric-card accent-purple">
@@ -113,6 +114,7 @@
                             </div>
                         </div>
                         <div class="metric-value" x-text="formatNumber(totals.processing)"></div>
+                        <div class="metric-sub" x-text="'+' + formatNumber(rates.processing_per_min || 0) + ' / min'"></div>
                         <div class="metric-bar"><div class="metric-bar-fill processing" :style="'width:' + pctOf(totals.processing, totals.total)"></div></div>
                     </div>
                     <div class="metric-card accent-green">
@@ -123,6 +125,7 @@
                             </div>
                         </div>
                         <div class="metric-value" x-text="formatNumber(totals.completed)"></div>
+                        <div class="metric-sub" x-text="'+' + formatNumber(rates.completed_per_min || 0) + ' / min'"></div>
                         <div class="metric-bar"><div class="metric-bar-fill completed" :style="'width:' + pctOf(totals.completed, totals.total)"></div></div>
                     </div>
                     <div class="metric-card accent-red">
@@ -133,41 +136,8 @@
                             </div>
                         </div>
                         <div class="metric-value" x-text="formatNumber(totals.failed)"></div>
+                        <div class="metric-sub" x-text="'+' + formatNumber(rates.failed_per_min || 0) + ' / min'"></div>
                         <div class="metric-bar"><div class="metric-bar-fill failed" :style="'width:' + pctOf(totals.failed, totals.total)"></div></div>
-                    </div>
-                </div>
-
-                <!-- Rate Cards (last 60 seconds) -->
-                <div class="metric-cards rates-strip">
-                    <div class="metric-card accent-blue">
-                        <div class="metric-header">
-                            <span class="metric-label">Added / min</span>
-                            <div class="metric-icon pending">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                            </div>
-                        </div>
-                        <div class="metric-value" x-text="formatNumber(rates.added_per_min || 0)"></div>
-                        <div class="metric-sub">jobs dispatched (last 60s)</div>
-                    </div>
-                    <div class="metric-card accent-green">
-                        <div class="metric-header">
-                            <span class="metric-label">Processed / min</span>
-                            <div class="metric-icon completed">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-                            </div>
-                        </div>
-                        <div class="metric-value" x-text="formatNumber(rates.processed_per_min || 0)"></div>
-                        <div class="metric-sub">jobs completed (last 60s)</div>
-                    </div>
-                    <div class="metric-card accent-red">
-                        <div class="metric-header">
-                            <span class="metric-label">Failed / min</span>
-                            <div class="metric-icon failed">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                            </div>
-                        </div>
-                        <div class="metric-value" x-text="formatNumber(rates.failed_per_min || 0)"></div>
-                        <div class="metric-sub">jobs failed (last 60s)</div>
                     </div>
                 </div>
 
@@ -358,18 +328,22 @@
                                 <div class="qc-stat">
                                     <span class="qc-stat-val pending" x-text="q.pending"></span>
                                     <span class="qc-stat-lbl">Pending</span>
+                                    <span class="qc-stat-rate" x-text="'+' + ((q.rates && q.rates.pending_per_min) || 0) + '/m'"></span>
                                 </div>
                                 <div class="qc-stat">
                                     <span class="qc-stat-val processing" x-text="q.processing"></span>
                                     <span class="qc-stat-lbl">Processing</span>
+                                    <span class="qc-stat-rate" x-text="'+' + ((q.rates && q.rates.processing_per_min) || 0) + '/m'"></span>
                                 </div>
                                 <div class="qc-stat">
                                     <span class="qc-stat-val completed" x-text="q.completed"></span>
                                     <span class="qc-stat-lbl">Completed</span>
+                                    <span class="qc-stat-rate" x-text="'+' + ((q.rates && q.rates.completed_per_min) || 0) + '/m'"></span>
                                 </div>
                                 <div class="qc-stat">
                                     <span class="qc-stat-val failed" x-text="q.failed"></span>
                                     <span class="qc-stat-lbl">Failed</span>
+                                    <span class="qc-stat-rate" x-text="'+' + ((q.rates && q.rates.failed_per_min) || 0) + '/m'"></span>
                                 </div>
                             </div>
                         </div>

@@ -90,6 +90,7 @@ class Worker:
 
         try:
             await self.events.emit("job.started", payload=payload, worker=self.name)
+            await self.driver.record_metric(payload.queue, "processing", 1)
             logger.debug("Processing job %s (%s)", payload.id, payload.job_class)
 
             job_instance = self._instantiate(payload)

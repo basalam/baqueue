@@ -471,7 +471,7 @@ class RedisDriver(BaseDriver):
         self, seconds: int = 60, queue: str | None = None,
     ) -> dict[str, int]:
         cutoff = _now_ts() - seconds
-        out = {"completed": 0, "failed": 0}
+        out = {"processing": 0, "completed": 0, "failed": 0}
         queue_names = [queue] if queue else await self.queues()
         for q in queue_names:
             entries_raw = await self._redis.lrange(self._key("metrics", q), 0, -1)

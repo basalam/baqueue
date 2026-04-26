@@ -263,7 +263,7 @@ class MemoryDriver(BaseDriver):
         self, seconds: int = 60, queue: str | None = None,
     ) -> dict[str, int]:
         cutoff = _now_ts() - seconds
-        result = {"completed": 0, "failed": 0}
+        result = {"processing": 0, "completed": 0, "failed": 0}
         queues = [queue] if queue else list(self._metrics.keys())
         for q in queues:
             for e in self._metrics.get(q, []):

@@ -518,7 +518,7 @@ class PostgresDriver(BaseDriver):
                         GROUP BY metric""",
                     cutoff,
                 )
-        out = {"completed": 0, "failed": 0}
+        out = {"processing": 0, "completed": 0, "failed": 0}
         for r in rows:
             if r["metric"] in out:
                 out[r["metric"]] = int(r["cnt"])

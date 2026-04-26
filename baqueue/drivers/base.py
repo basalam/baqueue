@@ -146,6 +146,6 @@ class BaseDriver(ABC):
     async def recent_throughput(
         self, seconds: int = 60, queue: str | None = None,
     ) -> dict[str, int]:
-        """Count completed/failed events recorded in the last `seconds`.
-        Returns a dict like {"completed": N, "failed": N}."""
+        """Count processing/completed/failed events recorded in the last `seconds`.
+        Returns a dict like {"processing": N, "completed": N, "failed": N}."""
         ...

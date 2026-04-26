@@ -593,7 +593,7 @@ class SqliteDriver(BaseDriver):
                        GROUP BY metric""",
                     (cutoff,),
                 ).fetchall()
-            out = {"completed": 0, "failed": 0}
+            out = {"processing": 0, "completed": 0, "failed": 0}
             for r in rows:
                 if r["metric"] in out:
                     out[r["metric"]] = r["cnt"]

@@ -7,7 +7,7 @@ document.addEventListener("alpine:init", () => {
     sidebarCollapsed: false,
 
     totals: { pending: 0, processing: 0, completed: 0, failed: 0, queues: 0, total: 0 },
-    rates: { added_per_min: 0, processed_per_min: 0, failed_per_min: 0 },
+    rates: { pending_per_min: 0, processing_per_min: 0, completed_per_min: 0, failed_per_min: 0 },
     queues: [],
     supervisors: [],
     recentJobs: [],

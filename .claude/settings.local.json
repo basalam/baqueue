@@ -8,7 +8,8 @@
       "Bash(python -m baqueue.cli dashboard --port 9101)",
       "Bash(echo \"dashboard PID: $!\")",
       "Bash(curl -s -o /dev/null -w \"/api/jobs \\(empty DB\\) status=%{http_code} time=%{time_total}s\\\\n\" \"http://127.0.0.1:9101/api/jobs?per_page=10&page=1\")",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "Bash(pip show *)"
     ]
   }
 }
