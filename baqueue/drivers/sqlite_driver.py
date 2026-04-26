@@ -65,8 +65,14 @@ class SqliteDriver(BaseDriver):
                     raise
 
     async def _run(self, fn):
-        """Run a sync read-only sqlite call off the event loop."""
-        return await asyncio.to_thread(fn)
+        """Run a sync read-only sqlite call off the event loop.
+
+        The lock is required because Python's sqlite3 module does not allow
+        concurrent use of a single Connection across threads — even with
+        check_same_thread=False. Two parallel `to_thread` callbacks hitting the
+        same connection raise `InterfaceError: bad parameter or other API misuse`."""
+        async with self._lock:
+            return await asyncio.to_thread(fn)
 
     def _ensure_tables(self) -> None:
         c = self._get_conn()

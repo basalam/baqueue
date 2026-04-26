@@ -20,6 +20,7 @@ logger = logging.getLogger("baqueue.dashboard")
 STATIC_DIR = Path(__file__).parent / "static"
 
 OVERVIEW_BROADCAST_INTERVAL = 2.0
+JOBS_PUSH_INTERVAL = 1.5
 
 
 def create_app(driver: BaseDriver, config: Optional[BaQueueConfig] = None) -> Any:
@@ -181,5 +182,64 @@ def create_app(driver: BaseDriver, config: Optional[BaQueueConfig] = None) -> An
         finally:
             if ws in connected_ws:
                 connected_ws.remove(ws)
+
+    @app.websocket("/ws/jobs")
+    async def jobs_websocket(ws: WebSocket):
+        """Per-connection jobs feed. Subscriber sends a {"type":"subscribe","filters":{...}}
+        message; server pushes filtered jobs_list snapshots on a tick until disconnect."""
+        await ws.accept()
+        filters: dict[str, Any] = {
+            "queue": None, "status": None, "tag": None, "batch_id": None,
+            "page": 1, "per_page": 25,
+            "created_from": None, "created_to": None,
+        }
+        push_lock = asyncio.Lock()
+
+        async def push_snapshot() -> bool:
+            async with push_lock:
+                try:
+                    data = await api.jobs_list(**filters)
+                    await ws.send_json(data)
+                    return True
+                except WebSocketDisconnect:
+                    return False
+                except Exception:
+                    logger.exception("ws/jobs push failed")
+                    return True
+
+        async def push_loop() -> None:
+            while True:
+                await asyncio.sleep(JOBS_PUSH_INTERVAL)
+                if not await push_snapshot():
+                    return
+
+        push_task = asyncio.create_task(push_loop())
+        try:
+            await push_snapshot()
+            while True:
+                msg = await ws.receive_json()
+                if msg.get("type") == "subscribe":
+                    incoming = msg.get("filters") or {}
+                    for k in filters:
+                        if k not in incoming:
+                            continue
+                        v = incoming[k]
+                        if k in ("page", "per_page"):
+                            filters[k] = int(v) if v is not None else filters[k]
+                        elif k in ("created_from", "created_to"):
+                            filters[k] = float(v) if v not in (None, "") else None
+                        else:
+                            filters[k] = v if v not in (None, "") else None
+                    await push_snapshot()
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            push_task.cancel()
+            try:
+                await push_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     return app

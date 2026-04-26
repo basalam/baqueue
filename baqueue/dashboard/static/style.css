@@ -634,7 +634,27 @@ body {
     box-shadow: 0 0 0 2px var(--accent-glow);
 }
 
-.jobs-count { font-size: 13px; color: var(--text-muted); }
+.jobs-count { font-size: 13px; color: var(--text-muted); display: inline-flex; align-items: center; gap: 10px; }
+
+.live-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: var(--green);
+    background: var(--green-surface);
+    padding: 2px 8px;
+    border-radius: 999px;
+}
+
+.live-indicator .live-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 1.5s infinite;
+}
 
 .jobs-table { width: 100%; border-collapse: collapse; }
 
@@ -660,6 +680,20 @@ body {
 .clickable-row { cursor: pointer; }
 .clickable-row:hover td { background: var(--bg-hover); }
 .clickable-row:last-child td { border-bottom: none; }
+
+@keyframes row-enter-anim {
+    0%   { background: var(--blue-surface); transform: translateY(-4px); opacity: 0; }
+    60%  { background: var(--blue-surface); transform: translateY(0);    opacity: 1; }
+    100% { background: transparent;          transform: translateY(0);    opacity: 1; }
+}
+
+@keyframes row-flash-anim {
+    0%   { background: var(--purple-surface); }
+    100% { background: transparent; }
+}
+
+.clickable-row.row-enter td { animation: row-enter-anim 700ms ease-out; }
+.clickable-row.row-flash td { animation: row-flash-anim 700ms ease-out; }
 
 .cell-id { font-size: 12px; }
 .cell-class { font-weight: 600; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

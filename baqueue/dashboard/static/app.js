@@ -4,6 +4,8 @@ document.addEventListener("alpine:init", () => {
     theme: localStorage.getItem("bq-theme") || "dark",
     connected: false,
     ws: null,
+    jobsWS: null,
+    jobsWSConnected: false,
     sidebarCollapsed: false,
 
     totals: { pending: 0, processing: 0, completed: 0, failed: 0, queues: 0, total: 0 },
@@ -38,13 +40,14 @@ document.addEventListener("alpine:init", () => {
           this.fetchOverview();
           this.fetchRecentJobs();
         }
-        if (this.tab === "jobs") this.fetchJobs();
+        if (this.tab === "jobs" && !this.jobsWSConnected) this.fetchJobs();
       }, 3000);
     },
 
     destroy() {
       if (this.refreshTimer) clearInterval(this.refreshTimer);
       if (this.ws) this.ws.close();
+      this.disconnectJobsWS();
     },
 
     toggleTheme() {
@@ -54,8 +57,14 @@ document.addEventListener("alpine:init", () => {
     },
 
     switchTab(t) {
+      const prev = this.tab;
       this.tab = t;
-      if (t === "jobs") this.fetchJobs();
+      if (t === "jobs") {
+        this.fetchJobs();
+        this.connectJobsWS();
+      } else if (prev === "jobs") {
+        this.disconnectJobsWS();
+      }
       if (t === "overview") {
         this.fetchOverview();
         this.fetchRecentJobs();
@@ -135,6 +144,79 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
+    // ── Jobs WebSocket ──────────────────────────────────────
+
+    connectJobsWS() {
+      if (this.jobsWS) return;
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${location.host}/ws/jobs`;
+      try {
+        const ws = new WebSocket(url);
+        this.jobsWS = ws;
+        ws.onopen = () => {
+          this.jobsWSConnected = true;
+          this._sendJobsSubscription();
+        };
+        ws.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            this._mergeJobs(data.jobs || []);
+            this.jobsTotal = data.total || 0;
+          } catch (_err) { /* ignore */ }
+        };
+        ws.onclose = () => {
+          this.jobsWSConnected = false;
+          this.jobsWS = null;
+          // If user is still on the jobs tab, reconnect after a short delay.
+          if (this.tab === "jobs") setTimeout(() => this.connectJobsWS(), 2000);
+        };
+      } catch (_err) { /* ignore */ }
+    },
+
+    disconnectJobsWS() {
+      this.jobsWSConnected = false;
+      if (this.jobsWS) {
+        const ws = this.jobsWS;
+        this.jobsWS = null;
+        ws.onclose = null;
+        try { ws.close(); } catch (_e) { /* ignore */ }
+      }
+    },
+
+    _sendJobsSubscription() {
+      if (!this.jobsWS || this.jobsWS.readyState !== WebSocket.OPEN) return;
+      const dp = this.getDateParams();
+      this.jobsWS.send(JSON.stringify({
+        type: "subscribe",
+        filters: {
+          queue: this.jobsFilter.queue || null,
+          status: this.jobsFilter.status || null,
+          tag: this.jobsFilter.tag || null,
+          page: this.jobsPage,
+          per_page: 25,
+          created_from: dp.created_from || null,
+          created_to: dp.created_to || null,
+        },
+      }));
+    },
+
+    _mergeJobs(newList) {
+      const oldMap = new Map((this.jobs || []).map((j) => [j.id, j]));
+      const now = Date.now();
+      this.jobs = newList.map((j) => {
+        const old = oldMap.get(j.id);
+        if (!old) return { ...j, _entered: now };
+        if (
+          old.status !== j.status ||
+          old.attempts !== j.attempts ||
+          old.updated_at !== j.updated_at
+        ) {
+          return { ...j, _flash: now };
+        }
+        return j;
+      });
+    },
+
     // ── API calls ───────────────────────────────────────────
 
     async fetchOverview() {
@@ -185,6 +267,12 @@ document.addEventListener("alpine:init", () => {
     },
 
     async fetchJobs() {
+      // When the live WS is connected, just resubscribe with current filters —
+      // the server pushes the snapshot back on the same channel.
+      if (this.jobsWSConnected) {
+        this._sendJobsSubscription();
+        return;
+      }
       try {
         const params = new URLSearchParams();
         if (this.jobsFilter.queue) params.set("queue", this.jobsFilter.queue);
@@ -199,7 +287,7 @@ document.addEventListener("alpine:init", () => {
 
         const r = await fetch(`/api/jobs?${params}`);
         const data = await r.json();
-        this.jobs = data.jobs || [];
+        this._mergeJobs(data.jobs || []);
         this.jobsTotal = data.total || 0;
       } catch (e) { /* ignore */ }
     },

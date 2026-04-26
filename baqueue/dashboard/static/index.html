@@ -231,8 +231,11 @@
                                 <input class="filter-input" type="text" placeholder="Queue..." x-model="jobsFilter.queue" @input.debounce.300ms="jobsPage=1; fetchJobs()">
                                 <input class="filter-input" type="text" placeholder="Tag..." x-model="jobsFilter.tag" @input.debounce.300ms="jobsPage=1; fetchJobs()">
                             </div>
-                            <div class="jobs-count" x-show="jobsTotal > 0">
-                                <span x-text="jobsTotal + ' job(s) found'"></span>
+                            <div class="jobs-count">
+                                <span class="live-indicator" :class="{ on: jobsWSConnected }" x-show="jobsWSConnected" title="Live updates via WebSocket">
+                                    <span class="live-dot"></span>LIVE
+                                </span>
+                                <span x-show="jobsTotal > 0" x-text="jobsTotal + ' job(s) found'"></span>
                             </div>
                         </div>
                     </div>
@@ -258,7 +261,9 @@
                             </thead>
                             <tbody>
                                 <template x-for="job in jobs" :key="job.id">
-                                    <tr @click="viewJob(job.id)" class="clickable-row">
+                                    <tr @click="viewJob(job.id)"
+                                        class="clickable-row"
+                                        :class="{ 'row-enter': job._entered, 'row-flash': job._flash }">
                                         <td>
                                             <span class="status-pill" :class="job.status">
                                                 <span class="status-dot-sm"></span>
