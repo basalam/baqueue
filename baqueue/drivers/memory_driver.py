@@ -19,6 +19,7 @@ class MemoryDriver(BaseDriver):
         self._delayed: list[str] = []
         self._batches: dict[str, dict[str, Any]] = {}
         self._metrics: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._supervisors: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
@@ -202,6 +203,31 @@ class MemoryDriver(BaseDriver):
             }
         return result
 
+    async def report_supervisor(self, stats: dict[str, Any]) -> None:
+        now = _now_ts()
+        name = str(stats.get("name", "")).strip()
+        if not name:
+            return
+        async with self._lock:
+            self._supervisors[name] = {
+                "data": dict(stats),
+                "heartbeat_at": now,
+            }
+
+    async def get_supervisor_stats(self, stale_after: float = 10.0) -> list[dict[str, Any]]:
+        cutoff = _now_ts() - stale_after
+        out: list[dict[str, Any]] = []
+        async with self._lock:
+            for name in sorted(self._supervisors):
+                item = self._supervisors[name]
+                if item.get("heartbeat_at", 0.0) < cutoff:
+                    continue
+                data = dict(item.get("data", {}))
+                if not data.get("running", False):
+                    continue
+                out.append(data)
+        return out
+
     # ── Batch helpers ───────────────────────────────────────────
 
     async def store_batch(self, batch_id: str, data: dict[str, Any]) -> None:
@@ -286,3 +312,4 @@ class MemoryDriver(BaseDriver):
             self._delayed.clear()
             self._batches.clear()
             self._metrics.clear()
+            self._supervisors.clear()

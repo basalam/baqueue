@@ -64,6 +64,9 @@ class RedisDriver(BaseDriver):
             return self._idx_status(status)
         return self._idx_all()
 
+    def _supervisor_key(self, name: str) -> str:
+        return self._key("supervisor", name)
+
     async def connect(self) -> None:
         try:
             import redis.asyncio as aioredis
@@ -380,6 +383,54 @@ class RedisDriver(BaseDriver):
                 "failed": failed,
             }
         return result
+
+    async def report_supervisor(self, stats: dict[str, Any]) -> None:
+        name = str(stats.get("name", "")).strip()
+        if not name:
+            return
+        ts = _now_ts()
+        key = self._supervisor_key(name)
+        payload = json.dumps(stats)
+        pipe = self._redis.pipeline()
+        pipe.hset(key, mapping={"data": payload, "heartbeat_at": ts})
+        pipe.sadd(self._key("supervisors"), name)
+        await pipe.execute()
+
+    async def get_supervisor_stats(self, stale_after: float = 10.0) -> list[dict[str, Any]]:
+        names = await self._redis.smembers(self._key("supervisors"))
+        if not names:
+            return []
+        cutoff = _now_ts() - stale_after
+
+        ordered = sorted(names)
+        pipe = self._redis.pipeline()
+        for name in ordered:
+            pipe.hmget(self._supervisor_key(name), "data", "heartbeat_at")
+        rows = await pipe.execute()
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if not row:
+                continue
+            raw_data, raw_heartbeat = row
+            if not raw_data:
+                continue
+            try:
+                heartbeat = float(raw_heartbeat) if raw_heartbeat is not None else 0.0
+            except (TypeError, ValueError):
+                heartbeat = 0.0
+            if heartbeat < cutoff:
+                continue
+            try:
+                data = json.loads(raw_data)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if not data.get("running", False):
+                continue
+            out.append(data)
+        return out
 
     # ── Batch helpers ───────────────────────────────────────────
 

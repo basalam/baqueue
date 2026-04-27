@@ -36,6 +36,10 @@ class PostgresDriver(BaseDriver):
     def _metrics_table(self) -> str:
         return f"{self._prefix}_metrics"
 
+    @property
+    def _supervisors_table(self) -> str:
+        return f"{self._prefix}_supervisors"
+
     async def connect(self) -> None:
         try:
             import asyncpg
@@ -119,6 +123,17 @@ class PostgresDriver(BaseDriver):
             await conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self._prefix}_metrics_recorded_at
                 ON {self._metrics_table} (recorded_at)
+            """)
+            await conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._supervisors_table} (
+                    name TEXT PRIMARY KEY,
+                    data JSONB NOT NULL DEFAULT '{{}}',
+                    heartbeat_at DOUBLE PRECISION NOT NULL
+                )
+            """)
+            await conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{self._prefix}_supervisors_heartbeat
+                ON {self._supervisors_table} (heartbeat_at)
             """)
 
     def _row_to_payload(self, row: Any) -> JobPayload:
@@ -400,6 +415,42 @@ class PostgresDriver(BaseDriver):
             result[queue] = {"pending": pending, "processing": 0, "completed": 0, "failed": 0}
         return result
 
+    async def report_supervisor(self, stats: dict[str, Any]) -> None:
+        name = str(stats.get("name", "")).strip()
+        if not name:
+            return
+        now = _now_ts()
+        payload = json.dumps(stats)
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"""INSERT INTO {self._supervisors_table} (name, data, heartbeat_at)
+                    VALUES ($1, $2::jsonb, $3)
+                    ON CONFLICT (name) DO UPDATE SET
+                        data=EXCLUDED.data,
+                        heartbeat_at=EXCLUDED.heartbeat_at""",
+                name, payload, now,
+            )
+
+    async def get_supervisor_stats(self, stale_after: float = 10.0) -> list[dict[str, Any]]:
+        cutoff = _now_ts() - stale_after
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""SELECT data FROM {self._supervisors_table}
+                    WHERE heartbeat_at >= $1
+                    ORDER BY name""",
+                cutoff,
+            )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            raw = row["data"]
+            data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if not isinstance(data, dict):
+                continue
+            if not data.get("running", False):
+                continue
+            out.append(data)
+        return out
+
     # ── Batch helpers ───────────────────────────────────────────
 
     async def store_batch(self, batch_id: str, data: dict[str, Any]) -> None:
@@ -489,7 +540,9 @@ class PostgresDriver(BaseDriver):
             if queue:
                 await conn.execute(f"DELETE FROM {self._jobs_table} WHERE queue=$1", queue)
             else:
-                await conn.execute(f"TRUNCATE {self._jobs_table}, {self._batches_table}, {self._metrics_table}")
+                await conn.execute(
+                    f"TRUNCATE {self._jobs_table}, {self._batches_table}, {self._metrics_table}, {self._supervisors_table}"
+                )
 
     async def prune_metrics(self, older_than_seconds: float) -> int:
         cutoff = _now_ts() - older_than_seconds

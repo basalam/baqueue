@@ -61,6 +61,9 @@ class DashboardAPI:
 
         dispatch_rate = await self.driver.count_jobs(created_from=rate_window_from)
         throughput = await self.driver.recent_throughput(seconds=60)
+        supervisors = await self.driver.get_supervisor_stats()
+        if not supervisors:
+            supervisors = self._supervisor_stats
 
         return {
             "totals": {
@@ -78,7 +81,7 @@ class DashboardAPI:
                 "failed_per_min": throughput.get("failed", 0),
             },
             "queues": queue_details,
-            "supervisors": self._supervisor_stats,
+            "supervisors": supervisors,
             "timestamp": now,
         }
 
@@ -150,6 +153,12 @@ class DashboardAPI:
 
     async def metrics_snapshot(self) -> dict[str, Any]:
         return await self.driver.get_metrics()
+
+    async def supervisors_snapshot(self) -> list[dict[str, Any]]:
+        data = await self.driver.get_supervisor_stats()
+        if data:
+            return data
+        return self._supervisor_stats
 
     async def stats(self, created_from: float | None = None, created_to: float | None = None) -> dict[str, Any]:
         """Aggregate statistics for the stats panel."""

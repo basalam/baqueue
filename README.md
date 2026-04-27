@@ -159,6 +159,59 @@ Dispatch jobs in another terminal:
 python examples/simple_job.py
 ```
 
+#### Workers Tab (Supervisor/Worker Monitoring)
+
+To see active supervisors/workers in the `Workers` tab, `work` and `dashboard`
+must point to the same backend (same driver and same URL/path).
+
+Example with SQLite:
+
+Terminal 1:
+```bash
+baqueue work -d sqlite --driver-url .baqueue.db -q default -w 3
+```
+
+Terminal 2:
+```bash
+baqueue dashboard -d sqlite --driver-url .baqueue.db
+```
+
+Then open:
+```text
+http://localhost:9100
+```
+
+Quick troubleshooting:
+- Check `http://localhost:9100/api/supervisors` (should return a non-empty `supervisors` list while workers are running).
+- If `api/supervisors` is empty, `work` and `dashboard` are likely using different driver URLs/paths.
+- `memory` driver is single-process only, so separate `work` and `dashboard` processes will not share worker state.
+
+Driver-specific CLI examples:
+
+SQLite (shared local file):
+```bash
+baqueue work -d sqlite --driver-url .baqueue.db -q default -w 3
+baqueue dashboard -d sqlite --driver-url .baqueue.db
+```
+
+Redis (shared Redis DB):
+```bash
+baqueue work -d redis --driver-url redis://localhost:6379/0 -q default -w 3
+baqueue dashboard -d redis --driver-url redis://localhost:6379/0
+```
+
+PostgreSQL (shared database/schema):
+```bash
+baqueue work -d postgres --driver-url postgresql://user:pass@localhost/dbname -q default -w 3
+baqueue dashboard -d postgres --driver-url postgresql://user:pass@localhost/dbname
+```
+
+Memory (single-process only):
+```bash
+# Use an in-process example to run workers + dashboard together.
+python examples/dashboard_demo.py
+```
+
 ### Drivers
 
 **SQLite (default, zero-config, cross-process):**

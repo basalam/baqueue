@@ -99,6 +99,16 @@ class BaseDriver(ABC):
     @abstractmethod
     async def get_metrics(self, queue: str | None = None) -> dict[str, Any]: ...
 
+    @abstractmethod
+    async def report_supervisor(self, stats: dict[str, Any]) -> None:
+        """Persist a supervisor snapshot for dashboard worker monitoring."""
+        ...
+
+    @abstractmethod
+    async def get_supervisor_stats(self, stale_after: float = 10.0) -> list[dict[str, Any]]:
+        """Return active supervisor snapshots (recent heartbeat only)."""
+        ...
+
     # ── Batch helpers ───────────────────────────────────────────
 
     @abstractmethod

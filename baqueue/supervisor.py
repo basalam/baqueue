@@ -37,6 +37,8 @@ class Supervisor:
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._delayed_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._balance_task: asyncio.Task | None = None
 
     @property
     def is_running(self) -> bool:
@@ -71,10 +73,12 @@ class Supervisor:
         for i in range(self.config.min_workers):
             self._spawn_worker(i)
 
+        await self._report_stats()
         self._delayed_task = asyncio.create_task(self._poll_delayed())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         if self.balancer:
-            asyncio.create_task(self._balance_loop())
+            self._balance_task = asyncio.create_task(self._balance_loop())
 
         try:
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -86,18 +90,31 @@ class Supervisor:
         logger.info("Supervisor '%s' shutting down...", self.config.name)
         self._running = False
 
+        await self._report_stats()
         for w in self._workers:
             w.stop()
 
         if self._delayed_task:
             self._delayed_task.cancel()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        if self._balance_task:
+            self._balance_task.cancel()
+
+        aux_tasks = [t for t in (self._delayed_task, self._heartbeat_task, self._balance_task) if t is not None]
+        if aux_tasks:
+            await asyncio.gather(*aux_tasks, return_exceptions=True)
+        self._delayed_task = None
+        self._heartbeat_task = None
+        self._balance_task = None
 
         for task in self._tasks:
             task.cancel()
 
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._workers.clear()
         self._tasks.clear()
+        self._workers.clear()
+        await self._report_stats()
 
         await self.events.emit("supervisor.stopped", supervisor=self.config.name)
         logger.info("Supervisor '%s' stopped", self.config.name)
@@ -153,6 +170,17 @@ class Supervisor:
             except Exception:
                 logger.exception("Error in balance loop")
             await asyncio.sleep(5)
+
+    async def _heartbeat_loop(self) -> None:
+        while self._running:
+            await self._report_stats()
+            await asyncio.sleep(1)
+
+    async def _report_stats(self) -> None:
+        try:
+            await self.driver.report_supervisor(self.stats)
+        except Exception:
+            logger.exception("Failed to report supervisor stats")
 
     def _setup_signal_handlers(self) -> None:
         if os.name == "nt":

@@ -119,6 +119,13 @@ class SqliteDriver(BaseDriver):
             );
             CREATE INDEX IF NOT EXISTS idx_metrics_queue_metric ON metrics (queue, metric);
             CREATE INDEX IF NOT EXISTS idx_metrics_recorded_at ON metrics (recorded_at);
+
+            CREATE TABLE IF NOT EXISTS supervisors (
+                name TEXT PRIMARY KEY,
+                data TEXT NOT NULL DEFAULT '{}',
+                heartbeat_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_supervisors_heartbeat ON supervisors (heartbeat_at);
         """)
 
     def _row_to_payload(self, row: sqlite3.Row) -> JobPayload:
@@ -460,6 +467,50 @@ class SqliteDriver(BaseDriver):
 
         return await self._run(_do)
 
+    async def report_supervisor(self, stats: dict[str, Any]) -> None:
+        name = str(stats.get("name", "")).strip()
+        if not name:
+            return
+        now = _now_ts()
+        payload = json.dumps(stats)
+        async with self._lock:
+            def _do():
+                c = self._get_conn()
+                c.execute(
+                    """INSERT INTO supervisors (name, data, heartbeat_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(name) DO UPDATE SET
+                           data=excluded.data,
+                           heartbeat_at=excluded.heartbeat_at""",
+                    (name, payload, now),
+                )
+                c.commit()
+            await self._execute_with_retry(_do)
+
+    async def get_supervisor_stats(self, stale_after: float = 10.0) -> list[dict[str, Any]]:
+        cutoff = _now_ts() - stale_after
+
+        def _do():
+            return self._get_conn().execute(
+                "SELECT data FROM supervisors WHERE heartbeat_at >= ? ORDER BY name",
+                (cutoff,),
+            ).fetchall()
+
+        rows = await self._run(_do)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            raw = row["data"]
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if not data.get("running", False):
+                continue
+            out.append(data)
+        return out
+
     # ── Batch helpers ───────────────────────────────────────────
 
     async def store_batch(self, batch_id: str, data: dict[str, Any]) -> None:
@@ -563,7 +614,7 @@ class SqliteDriver(BaseDriver):
                 if queue:
                     c.execute("DELETE FROM jobs WHERE queue=?", (queue,))
                 else:
-                    c.executescript("DELETE FROM jobs; DELETE FROM batches; DELETE FROM metrics;")
+                    c.executescript("DELETE FROM jobs; DELETE FROM batches; DELETE FROM metrics; DELETE FROM supervisors;")
                 c.commit()
             await self._execute_with_retry(_do)
 

@@ -163,6 +163,11 @@ def create_app(driver: BaseDriver, config: Optional[BaQueueConfig] = None) -> An
         data = await api.metrics_snapshot()
         return JSONResponse(data)
 
+    @app.get("/api/supervisors")
+    async def get_supervisors():
+        data = await api.supervisors_snapshot()
+        return JSONResponse({"supervisors": data})
+
     # ── WebSocket ───────────────────────────────────────────────
 
     @app.websocket("/ws")

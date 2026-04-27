@@ -33,6 +33,7 @@ document.addEventListener("alpine:init", () => {
     init() {
       document.documentElement.setAttribute("data-theme", this.theme);
       this.fetchOverview();
+      this.fetchSupervisors();
       this.fetchRecentJobs();
       this.connectWS();
       this.refreshTimer = setInterval(() => {
@@ -41,6 +42,7 @@ document.addEventListener("alpine:init", () => {
           this.fetchRecentJobs();
         }
         if (this.tab === "jobs" && !this.jobsWSConnected) this.fetchJobs();
+        if (this.tab === "workers") this.fetchSupervisors();
       }, 3000);
     },
 
@@ -68,6 +70,8 @@ document.addEventListener("alpine:init", () => {
       if (t === "overview") {
         this.fetchOverview();
         this.fetchRecentJobs();
+      } else if (t === "workers") {
+        this.fetchSupervisors();
       }
     },
 
@@ -263,6 +267,14 @@ document.addEventListener("alpine:init", () => {
         const r = await fetch(`/api/jobs?${params}`);
         const data = await r.json();
         this.recentJobs = data.jobs || [];
+      } catch (e) { /* ignore */ }
+    },
+
+    async fetchSupervisors() {
+      try {
+        const r = await fetch("/api/supervisors");
+        const data = await r.json();
+        this.supervisors = data.supervisors || [];
       } catch (e) { /* ignore */ }
     },
 
