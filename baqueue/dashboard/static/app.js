@@ -7,6 +7,7 @@ document.addEventListener("alpine:init", () => {
     jobsWS: null,
     jobsWSConnected: false,
     sidebarCollapsed: false,
+    sidebarMobileOpen: false,
 
     totals: { pending: 0, processing: 0, completed: 0, failed: 0, queues: 0, total: 0 },
     rates: { pending_per_min: 0, processing_per_min: 0, completed_per_min: 0, failed_per_min: 0 },
@@ -61,6 +62,7 @@ document.addEventListener("alpine:init", () => {
     switchTab(t) {
       const prev = this.tab;
       this.tab = t;
+      this.sidebarMobileOpen = false;
       if (t === "jobs") {
         this.fetchJobs();
         this.connectJobsWS();
@@ -320,6 +322,25 @@ document.addEventListener("alpine:init", () => {
       this.fetchOverview();
     },
 
+    async retryAllFailed() {
+      const parts = [];
+      if (this.jobsFilter.queue) parts.push(`queue "${this.jobsFilter.queue}"`);
+      if (this.jobsFilter.tag) parts.push(`tag "${this.jobsFilter.tag}"`);
+      const scope = parts.length ? ` (${parts.join(", ")})` : "";
+      if (!confirm(`Retry ${this.jobsTotal} failed job(s)${scope}?`)) return;
+      try {
+        const params = new URLSearchParams();
+        if (this.jobsFilter.queue) params.set("queue", this.jobsFilter.queue);
+        if (this.jobsFilter.tag) params.set("tag", this.jobsFilter.tag);
+        const dp = this.getDateParams();
+        if (dp.created_from) params.set("created_from", dp.created_from);
+        if (dp.created_to) params.set("created_to", dp.created_to);
+        await fetch(`/api/jobs/retry-failed?${params}`, { method: "POST" });
+        this.fetchJobs();
+        this.fetchOverview();
+      } catch (_e) { /* ignore */ }
+    },
+
     async deleteJob(jobId) {
       await fetch(`/api/jobs/${jobId}`, { method: "DELETE" });
       this.closeModal();
@@ -388,6 +409,22 @@ document.addEventListener("alpine:init", () => {
       if (diff < 3600) return Math.floor(diff / 60) + "m ago";
       if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
       return Math.floor(diff / 86400) + "d ago";
+    },
+
+    isScheduled(job) {
+      if (!job || !job.delay_until) return false;
+      if (job.status !== "pending") return false;
+      return job.delay_until * 1000 > Date.now();
+    },
+
+    scheduledIn(ts) {
+      if (!ts) return "";
+      const diff = ts - Date.now() / 1000;
+      if (diff <= 0) return "now";
+      if (diff < 60) return `in ${Math.ceil(diff)}s`;
+      if (diff < 3600) return `in ${Math.ceil(diff / 60)}m`;
+      if (diff < 86400) return `in ${Math.ceil(diff / 3600)}h`;
+      return `in ${Math.ceil(diff / 86400)}d`;
     },
 
     jobDuration(job) {

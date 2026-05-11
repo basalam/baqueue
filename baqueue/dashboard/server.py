@@ -132,6 +132,19 @@ def create_app(driver: BaseDriver, config: Optional[BaQueueConfig] = None) -> An
             return JSONResponse({"error": "Job not found"}, status_code=404)
         return JSONResponse(data)
 
+    @app.post("/api/jobs/retry-failed")
+    async def retry_failed(
+        queue: Optional[str] = Query(None),
+        tag: Optional[str] = Query(None),
+        created_from: Optional[float] = Query(None),
+        created_to: Optional[float] = Query(None),
+    ):
+        count = await api.retry_failed_jobs(
+            queue=queue, tag=tag,
+            created_from=created_from, created_to=created_to,
+        )
+        return JSONResponse({"retried": count})
+
     @app.post("/api/jobs/{job_id}/retry")
     async def retry_job(job_id: str):
         ok = await api.retry_job(job_id)

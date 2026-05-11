@@ -110,6 +110,39 @@ class Queue:
     async def get_jobs(cls, **kwargs: Any) -> list[JobPayload]:
         return await cls.get_driver().get_jobs(**kwargs)
 
+    # ── Retry ───────────────────────────────────────────────────
+
+    @classmethod
+    async def retry_failed(
+        cls,
+        queue: str | None = None,
+        tag: str | None = None,
+        created_from: float | None = None,
+        created_to: float | None = None,
+    ) -> int:
+        """Retry all failed jobs matching the optional filters. Returns count retried.
+
+        Each matched job is released back onto its queue with ``delay=0`` —
+        the same path used by single-job retry.
+        """
+        driver = cls.get_driver()
+        count = 0
+        batch_size = 200
+        # release() flips status to pending, so failed-filtered fetches naturally
+        # shrink. Cap iterations as a safety net.
+        for _ in range(1000):
+            jobs = await driver.get_jobs(
+                status="failed", queue=queue, tag=tag,
+                created_from=created_from, created_to=created_to,
+                offset=0, limit=batch_size,
+            )
+            if not jobs:
+                break
+            for job in jobs:
+                await driver.release(job, delay=0)
+                count += 1
+        return count
+
     # ── Prune ───────────────────────────────────────────────────
 
     @classmethod

@@ -62,3 +62,18 @@ include = ["baqueue*"]
 
 [tool.setuptools.package-data]
 "baqueue.dashboard" = ["static/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore::DeprecationWarning:websockets",
+    "ignore::DeprecationWarning:uvicorn",
+]
+markers = [
+    "slow: marks tests as slow (deselect with -m 'not slow')",
+    "integration: marks tests that exercise the full driver+worker+supervisor stack",
+    "dashboard: marks tests that touch the dashboard server",
+    "sqlite: marks tests parameterized for the SQLite driver",
+]

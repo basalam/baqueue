@@ -12,8 +12,11 @@
 </head>
 <body x-data="dashboard">
 
+    <!-- Mobile Sidebar Backdrop -->
+    <div class="sidebar-backdrop" :class="{ visible: sidebarMobileOpen }" @click="sidebarMobileOpen = false"></div>
+
     <!-- Sidebar -->
-    <aside class="sidebar" :class="{ collapsed: sidebarCollapsed }">
+    <aside class="sidebar" :class="{ collapsed: sidebarCollapsed, 'mobile-open': sidebarMobileOpen }">
         <div class="sidebar-brand">
             <div class="brand-icon">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
@@ -53,6 +56,9 @@
         <!-- Top Bar -->
         <header class="topbar">
             <div class="topbar-left">
+                <button class="menu-toggle" @click="sidebarMobileOpen = !sidebarMobileOpen" aria-label="Toggle menu">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+                </button>
                 <h1 class="page-title" x-text="pageTitle"></h1>
                 <div class="connection-badge" :class="connected ? 'online' : 'offline'">
                     <span class="conn-dot"></span>
@@ -200,6 +206,12 @@
                                         <div class="activity-title">
                                             <span class="activity-class" x-text="shortClass(job.job_class)"></span>
                                             <span class="activity-queue" x-text="job.queue"></span>
+                                            <span class="scheduled-badge tooltip-host"
+                                                  x-show="isScheduled(job)"
+                                                  :data-tooltip="'Scheduled: ' + formatTimeFull(job.delay_until)">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                                                <span x-text="scheduledIn(job.delay_until)"></span>
+                                            </span>
                                         </div>
                                         <div class="activity-meta">
                                             <span class="mono" x-text="shortId(job.id)"></span>
@@ -228,10 +240,22 @@
                                     <option value="completed">Completed</option>
                                     <option value="failed">Failed</option>
                                 </select>
-                                <input class="filter-input" type="text" placeholder="Queue..." x-model="jobsFilter.queue" @input.debounce.300ms="jobsPage=1; fetchJobs()">
+                                <select class="filter-select" x-model="jobsFilter.queue" @change="jobsPage=1; fetchJobs()">
+                                    <option value="">All Queues</option>
+                                    <template x-for="q in queues" :key="q.name">
+                                        <option :value="q.name" x-text="q.name"></option>
+                                    </template>
+                                </select>
                                 <input class="filter-input" type="text" placeholder="Tag..." x-model="jobsFilter.tag" @input.debounce.300ms="jobsPage=1; fetchJobs()">
                             </div>
                             <div class="jobs-count">
+                                <button class="btn-bulk-retry"
+                                        x-show="jobsFilter.status === 'failed' && jobsTotal > 0"
+                                        @click="retryAllFailed()"
+                                        title="Retry all failed jobs matching current filters">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+                                    Retry All (<span x-text="jobsTotal"></span>)
+                                </button>
                                 <span class="live-indicator" :class="{ on: jobsWSConnected }" x-show="jobsWSConnected" title="Live updates via WebSocket">
                                     <span class="live-dot"></span>LIVE
                                 </span>
@@ -265,17 +289,29 @@
                                         class="clickable-row"
                                         :class="{ 'row-enter': job._entered, 'row-flash': job._flash }">
                                         <td>
-                                            <span class="status-pill" :class="job.status">
-                                                <span class="status-dot-sm"></span>
-                                                <span x-text="job.status"></span>
-                                            </span>
+                                            <div class="status-cell">
+                                                <span class="status-pill" :class="job.status">
+                                                    <span class="status-dot-sm"></span>
+                                                    <span x-text="job.status"></span>
+                                                </span>
+                                                <span class="scheduled-badge tooltip-host"
+                                                      x-show="isScheduled(job)"
+                                                      :data-tooltip="'Scheduled: ' + formatTimeFull(job.delay_until)">
+                                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                                                    <span x-text="scheduledIn(job.delay_until)"></span>
+                                                </span>
+                                            </div>
                                         </td>
                                         <td class="mono cell-id" x-text="shortId(job.id)"></td>
                                         <td class="cell-class" x-text="shortClass(job.job_class)"></td>
                                         <td><span class="queue-pill" x-text="job.queue"></span></td>
                                         <td class="cell-attempts">
                                             <span x-text="job.attempts + '/' + job.max_attempts"></span>
-                                            <div class="attempt-bar"><div class="attempt-fill" :style="'width:' + (job.attempts / job.max_attempts * 100) + '%'"></div></div>
+                                            <div class="attempt-bar">
+                                                <div class="attempt-fill"
+                                                     :class="{ over: job.attempts > job.max_attempts }"
+                                                     :style="'width:' + Math.min(job.attempts / job.max_attempts * 100, 100) + '%'"></div>
+                                            </div>
                                         </td>
                                         <td class="cell-time" x-text="formatTime(job.created_at)"></td>
                                         <td class="cell-time" x-text="jobDuration(job)"></td>
@@ -441,6 +477,16 @@
                             <span class="dc-label">Backoff</span>
                             <span class="dc-value" x-text="JSON.stringify(selectedJob.backoff)"></span>
                         </div>
+                        <div class="detail-card" x-show="selectedJob.delay_until" style="grid-column: 1 / -1;">
+                            <span class="dc-label">Scheduled For</span>
+                            <div class="dc-scheduled">
+                                <span class="scheduled-badge">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                                    <span x-text="scheduledIn(selectedJob.delay_until)"></span>
+                                </span>
+                                <span class="dc-value" x-text="formatTimeFull(selectedJob.delay_until)"></span>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="detail-section">
@@ -456,6 +502,13 @@
                                 <div class="tl-content">
                                     <span class="tl-label">Created</span>
                                     <span class="tl-time" x-text="formatTimeFull(selectedJob.created_at)"></span>
+                                </div>
+                            </div>
+                            <div class="tl-item" x-show="selectedJob.delay_until">
+                                <div class="tl-dot scheduled"></div>
+                                <div class="tl-content">
+                                    <span class="tl-label">Scheduled For</span>
+                                    <span class="tl-time" x-text="formatTimeFull(selectedJob.delay_until)"></span>
                                 </div>
                             </div>
                             <div class="tl-item" x-show="selectedJob.started_at">

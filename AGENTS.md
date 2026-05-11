@@ -18,7 +18,7 @@ baqueue/
 ├── __init__.py           # Public exports: BaQueueConfig, Job, Queue, Batch, EventBus, BackoffStrategy
 ├── config.py             # Pydantic models: BaQueueConfig, DriverConfig, SupervisorConfig, ScheduleEntry
 ├── job.py                # Job base class + @Job.as_job decorator + FunctionJob wrapper
-├── queue.py              # Queue singleton facade: configure / connect / push / later / bulk / prune / metrics
+├── queue.py              # Queue singleton facade: configure / connect / push / later / bulk / retry_failed / prune / metrics
 ├── batch.py              # Batch: fluent builder with .name/.then/.catch/.on_finally/.allow_failures/.tag/.dispatch
 ├── worker.py             # Worker loop: pop → handle → complete/fail/release with retry
 ├── supervisor.py         # Worker pool, graceful shutdown, delayed-job poller, balancing loop
@@ -28,7 +28,7 @@ baqueue/
 ├── retry.py              # BackoffStrategy enum + compute_delay + should_retry
 ├── events.py             # EventBus singleton: on / off / emit / emit_nowait
 ├── serializer.py         # JobPayload (slotted), resolve_job_class, get_class_path, _now_ts
-├── cli.py                # Click commands: work, schedule, dashboard, prune, status
+├── cli.py                # Click commands: work, schedule, dashboard, prune, retry-failed, status, test
 ├── drivers/
 │   ├── base.py           # BaseDriver ABC — implement these methods for any new driver
 │   ├── memory_driver.py  # In-process only; never share across processes
@@ -36,12 +36,27 @@ baqueue/
 │   ├── redis_driver.py   # Optional extra: pip install baqueue[redis]
 │   └── postgres_driver.py# Optional extra: pip install baqueue[postgres]
 ├── dashboard/
-│   ├── api.py            # DashboardAPI: overview/stats/jobs_list/job_detail/retry/delete/prune/...
-│   ├── server.py         # FastAPI app factory (create_app) + REST routes + /ws
+│   ├── api.py            # DashboardAPI: overview/stats/jobs_list/job_detail/retry/retry_failed_jobs/delete/prune/...
+│   ├── server.py         # FastAPI app factory (create_app) + REST routes + /ws + /ws/jobs
 │   └── static/           # index.html, app.js, style.css (packaged as package_data)
 └── screen/               # README screenshots (1.png, 2.png, 3.png) — do not edit
 examples/                 # Runnable demos: simple_job, batch_example, scheduled_example,
-                          # dashboard_demo, stress_test
+                          # dashboard_demo, delayed_jobs_demo, stress_test
+tests/                    # pytest suite — run via `baqueue test` or `pytest tests/`
+├── conftest.py           # Shared fixtures: memory_driver / sqlite_driver /
+│                         # parameterized `driver` / configured_queue / singleton reset
+├── test_serializer.py    # JobPayload roundtrip + class-path helpers
+├── test_retry.py         # Backoff strategies + should_retry
+├── test_job.py           # Job class + FunctionJob + @Job.as_job decorator
+├── test_queue.py         # Queue facade (push, later, bulk, prune, retry_failed)
+├── test_drivers.py       # Cross-driver contract tests (memory + sqlite parameterized)
+├── test_worker.py        # Worker lifecycle: success / failure / retry / timeout
+├── test_supervisor.py    # Supervisor pool + delayed-job promotion
+├── test_scheduler.py     # Scheduler interval dispatch
+├── test_pruner.py        # Pruner by status / tag / age
+├── test_batch.py         # Batch builder + lifecycle callbacks
+├── test_dashboard_api.py # DashboardAPI methods + bulk retry-failed
+└── test_cli.py           # click CliRunner — help text + validation
 pyproject.toml            # Build config, deps, optional extras [redis|postgres|dashboard|all|dev]
 README.md                 # User-facing docs and benchmarks
 ```
@@ -64,13 +79,19 @@ baqueue work -q emails -q payments -w 3 -b auto
 baqueue schedule
 baqueue dashboard            # http://localhost:9100
 baqueue prune --status completed --hours 24
+baqueue retry-failed -y
 baqueue status
+
+# Run the test suite (pytest under the hood — also installs via [dev] extra)
+baqueue test
+baqueue test -k retry_failed -v   # filter + verbose
+baqueue test --last-failed        # rerun only the previous run's failures
 
 # Lint (already used in repo history per "ruff check" commit)
 ruff check .
 ```
 
-There is no test suite committed yet; `pytest` and `pytest-asyncio` are listed under `[project.optional-dependencies].dev` for when tests are added.
+The full test suite lives in `tests/` and is run via `baqueue test` (a thin wrapper around `pytest`) or `pytest tests/` directly. `pytest` and `pytest-asyncio` are in `[project.optional-dependencies].dev`. Config lives in `[tool.pytest.ini_options]` (asyncio auto-mode, function-scoped loops, custom markers).
 
 ## Architectural Invariants
 
@@ -123,6 +144,11 @@ Extend `baqueue/cli.py`:
 - **Batch callbacks are wired on `dispatch()`** via `self._events.on(...)`. They check `batch_id` to filter. Multiple concurrent batches all listen on the same global event bus — the filter is what isolates them.
 - **`Queue.bulk` is much faster than looping `Queue.push`** because it calls `driver.push_many` once. The stress test relies on this for the ~28k–50k jobs/s dispatch rate quoted in the README.
 - **Dashboard WebSocket pushes overview every 2s** (`server.py::websocket_endpoint`). If you change the cadence, update the reconnect logic in `dashboard/static/app.js` to match.
+- **Dashboard route ordering matters.** Any static-path POST under `/api/jobs/...` (e.g. `/api/jobs/retry-failed`) **must be declared before** the `/api/jobs/{job_id}/retry` route in `server.py`, otherwise FastAPI matches the path-param route first and the literal segment becomes the `job_id`.
+- **Bulk retry lives on `Queue`, not on `DashboardAPI`.** The real implementation is `Queue.retry_failed(queue, tag, created_from, created_to)` in `queue.py`; `DashboardAPI.retry_failed_jobs` and the `baqueue retry-failed` CLI both delegate to it. The loop re-fetches `status="failed"` with `offset=0` after each batch — because `release()` flips status to `pending`, the failed-filtered list shrinks naturally. The iteration cap (`range(1000)`) is a safety net — don't remove it.
+- **Scheduled-job UI display rule.** A job is "scheduled" in the dashboard only when `status == "pending"` AND `delay_until * 1000 > Date.now()`. All drivers reset `delay_until` to `None` when the supervisor promotes a delayed job into the live queue, so the badge naturally disappears at execution time — don't add logic that infers "scheduled" from `delay_until` alone.
+- **Driver semantics differ for past-due delayed jobs.** `MemoryDriver.push` eagerly puts a job with `delay_until <= now` straight into the live queue; `SqliteDriver.push` keeps the row with `delay_until` set and relies on the next `pop_delayed()` to promote it. Both behaviours are correct — when writing driver-level tests, push with a tiny *future* delay + `asyncio.sleep` instead of a past timestamp.
+- **Tests reset singletons via an autouse fixture** in `tests/conftest.py`. `Queue` and `EventBus` are class-level singletons, so leaking config between tests will produce phantom failures. The `_reset_singletons` fixture is autouse — don't override or disable it without replacing it.
 - **`.baqueue.db`, `.baqueue.db-wal`, `.baqueue.db-shm`** are gitignored. Don't commit them — they appear whenever you run an example.
 - **`baqueue/screen/*.png`** are referenced from `README.md`. Don't move or rename them.
 

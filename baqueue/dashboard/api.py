@@ -135,6 +135,20 @@ class DashboardAPI:
         await self.driver.release(job, delay=0)
         return True
 
+    async def retry_failed_jobs(
+        self,
+        queue: str | None = None,
+        tag: str | None = None,
+        created_from: float | None = None,
+        created_to: float | None = None,
+    ) -> int:
+        """Retry all failed jobs matching the optional filters. Returns count."""
+        from baqueue.queue import Queue
+        return await Queue.retry_failed(
+            queue=queue, tag=tag,
+            created_from=created_from, created_to=created_to,
+        )
+
     async def delete_job(self, job_id: str) -> bool:
         await self.driver.delete(job_id)
         return True

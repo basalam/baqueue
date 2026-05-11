@@ -264,6 +264,61 @@ async def _run_prune(
         await Queue.disconnect()
 
 
+@cli.command(name="retry-failed")
+@click.option("--queue", "-q", default=None, help="Limit to a specific queue.")
+@click.option("--tag", "-t", default=None, help="Limit to a specific tag.")
+@click.option("--hours", default=None, type=float, help="Only retry jobs created within the last N hours.")
+@click.option("--driver", "-d", default="sqlite", help="Driver name (sqlite, memory, redis, postgres).")
+@click.option("--driver-url", default=None, help="Driver connection URL.")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
+@click.pass_context
+def retry_failed(
+    ctx: click.Context,
+    queue: str | None,
+    tag: str | None,
+    hours: float | None,
+    driver: str,
+    driver_url: str | None,
+    yes: bool,
+) -> None:
+    """Retry all failed jobs (optionally filtered by queue, tag, or age)."""
+    _validate_driver(driver)
+    config: BaQueueConfig = ctx.obj["config"]
+    config.driver = DriverConfig(name=driver, url=driver_url or "")
+
+    scope_parts = []
+    if queue:
+        scope_parts.append(f"queue={queue}")
+    if tag:
+        scope_parts.append(f"tag={tag}")
+    if hours:
+        scope_parts.append(f"created within last {hours}h")
+    scope_str = f" ({', '.join(scope_parts)})" if scope_parts else ""
+
+    if not yes:
+        click.confirm(f"Retry all failed jobs{scope_str}?", abort=True)
+
+    count = _run_async(_run_retry_failed, config, queue, tag, hours)
+    click.echo(f"Retried {count or 0} failed job(s).")
+
+
+async def _run_retry_failed(
+    config: BaQueueConfig,
+    queue: str | None,
+    tag: str | None,
+    hours: float | None,
+) -> int:
+    from baqueue.serializer import _now_ts
+
+    Queue.configure(config)
+    await Queue.connect()
+    try:
+        created_from = (_now_ts() - hours * 3600) if hours else None
+        return await Queue.retry_failed(queue=queue, tag=tag, created_from=created_from)
+    finally:
+        await Queue.disconnect()
+
+
 @cli.command()
 @click.option("--driver", "-d", default="sqlite", help="Driver name (sqlite, memory, redis, postgres).")
 @click.option("--driver-url", default=None, help="Driver connection URL.")
@@ -298,6 +353,60 @@ async def _show_status(config: BaQueueConfig) -> None:
             )
     finally:
         await Queue.disconnect()
+
+
+@cli.command()
+@click.option("--match", "-k", default=None, help="Run only tests whose name matches this expression.")
+@click.option("--marker", "-m", default=None, help="Run only tests with the given pytest marker (e.g. 'not slow').")
+@click.option("--path", "-p", default="tests", help="Test path or file (defaults to the tests/ folder).")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose pytest output.")
+@click.option("--quiet", "-q", is_flag=True, help="Quieter pytest output.")
+@click.option("--stop-on-first-failure", "-x", is_flag=True, help="Stop at the first failure.")
+@click.option("--last-failed", is_flag=True, help="Re-run only tests that failed in the previous run.")
+@click.option(
+    "--no-header", is_flag=True, default=False,
+    help="Suppress pytest's session header banner.",
+)
+def test(
+    match: str | None,
+    marker: str | None,
+    path: str,
+    verbose: bool,
+    quiet: bool,
+    stop_on_first_failure: bool,
+    last_failed: bool,
+    no_header: bool,
+) -> None:
+    """Run the BaQueue test suite (pytest under the hood)."""
+    try:
+        import pytest as _pytest
+    except ImportError:
+        click.echo(
+            "Error: pytest is not installed.\n"
+            "  Install it with: pip install baqueue[dev]\n"
+            "  Or directly:    pip install pytest pytest-asyncio",
+            err=True,
+        )
+        sys.exit(1)
+
+    args: list[str] = [path]
+    if verbose:
+        args.append("-v")
+    if quiet:
+        args.append("-q")
+    if stop_on_first_failure:
+        args.append("-x")
+    if last_failed:
+        args.append("--lf")
+    if match:
+        args.extend(["-k", match])
+    if marker:
+        args.extend(["-m", marker])
+    if no_header:
+        args.append("--no-header")
+
+    exit_code = _pytest.main(args)
+    sys.exit(int(exit_code))
 
 
 if __name__ == "__main__":

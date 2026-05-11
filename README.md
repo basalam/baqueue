@@ -132,6 +132,51 @@ await Queue.prune(status="completed", hours=24)
 await Queue.prune(tag="batch:newsletter")
 ```
 
+### Retry Failed Jobs
+
+Bulk-retry failed jobs from the CLI, from Python, or from the dashboard.
+
+**CLI:**
+
+```bash
+# Retry every failed job (asks for confirmation)
+baqueue retry-failed
+
+# Skip the confirmation prompt
+baqueue retry-failed -y
+
+# Limit to a specific queue
+baqueue retry-failed -q emails
+
+# Combine filters: queue + tag + age window
+baqueue retry-failed -q emails -t campaign --hours 24
+
+# Use a non-default driver
+baqueue retry-failed -d redis --driver-url redis://localhost:6379/0
+```
+
+**Python:**
+
+```python
+# Retry every failed job
+count = await Queue.retry_failed()
+
+# Retry only failed jobs in a queue
+count = await Queue.retry_failed(queue="emails")
+
+# Filter by tag and creation window
+from baqueue.serializer import _now_ts
+count = await Queue.retry_failed(
+    queue="emails",
+    tag="campaign",
+    created_from=_now_ts() - 24 * 3600,
+)
+```
+
+**Dashboard:** open the **Jobs** tab, set the Status filter to `Failed`, then click the amber **Retry All** button. The current Queue / Tag / date-range filters are respected.
+
+Each matched job is released back onto its queue with `delay=0`, the same path used by single-job retry.
+
 ### Dashboard
 
 ```bash
@@ -148,6 +193,10 @@ The dashboard includes:
 - Queue breakdown with progress bars
 - Worker monitoring with active/idle status
 - Dark/light theme toggle
+- **Scheduled-job badge** with hover tooltip showing exact execution time, plus a "Scheduled For" entry in the job timeline
+- **Bulk "Retry All"** button when the Jobs view is filtered to `failed` (respects the active queue/tag/date filters)
+- **Queue filter as a dropdown** auto-populated from active queues (no manual typing)
+- **Mobile-friendly** sidebar drawer with hamburger toggle on screens ≤900px
 
 Run in one terminal:
 ```bash
@@ -257,18 +306,68 @@ python examples/scheduled_example.py
 # Dashboard demo (open http://localhost:9100)
 python examples/dashboard_demo.py
 
+# Delayed jobs demo — shows the "Scheduled" badge with varied delays
+python examples/delayed_jobs_demo.py
+
 # Stress test (see Benchmarks section below)
 python examples/stress_test.py --jobs 1000 --workers 5 --bulk
 ```
 
+## Testing
+
+The full test suite lives in `tests/` and runs with one command:
+
+```bash
+# Run everything
+baqueue test
+
+# Quiet output, stop at the first failure
+baqueue test -q -x
+
+# Run only retry-failed related tests
+baqueue test -k "RetryFailed or retry_failed"
+
+# Re-run just the tests that failed last time
+baqueue test --last-failed
+
+# Filter by marker (markers defined in pyproject.toml)
+baqueue test -m "not slow"
+```
+
+`baqueue test` is a thin wrapper around `pytest`, so it picks up the project's
+`tool.pytest.ini_options` config (asyncio mode, marker definitions, etc.).
+You can also run pytest directly:
+
+```bash
+pip install baqueue[dev]
+pytest tests/ -v
+```
+
+Coverage includes:
+
+- Serializer / payload roundtrip (incl. `delay_until`)
+- Backoff strategies (`fixed`, `linear`, `exponential`, explicit list)
+- `Job` + `FunctionJob` + `@Job.as_job` decorator
+- `Queue` facade — push / later / bulk / prune / `retry_failed`
+- Cross-driver contract tests (memory + sqlite, parameterized)
+- Worker lifecycle: success / failure / retry / timeout
+- Supervisor pool + delayed-job promotion
+- Scheduler interval dispatch
+- Pruner by status / tag / age
+- Batch builder + completion callbacks
+- DashboardAPI (overview, jobs_list, retry, bulk retry-failed, prune, stats)
+- CLI command surface (help text, validation, `retry-failed` abort flow)
+
 ## CLI Commands
 
 ```
-baqueue work       Start processing jobs
-baqueue schedule   Start the job scheduler
-baqueue dashboard  Launch the monitoring dashboard
-baqueue prune      Prune old jobs
-baqueue status     Show queue status
+baqueue work          Start processing jobs
+baqueue schedule      Start the job scheduler
+baqueue dashboard     Launch the monitoring dashboard
+baqueue prune         Prune old jobs
+baqueue retry-failed  Retry all failed jobs (filter by queue/tag/age)
+baqueue status        Show queue status
+baqueue test          Run the test suite
 ```
 
 Use `-h` on any command for options:
