@@ -29,36 +29,60 @@ class Pruner:
         self.events = events or EventBus.default()
         self._running = False
 
+    # ── Threshold resolution ────────────────────────────────────
+    # New *_seconds fields are primary. The legacy *_hours fields override
+    # when set to a positive value, so existing JSON configs keep working.
+
+    @property
+    def completed_threshold(self) -> float:
+        if self.config.prune_completed_hours > 0:
+            return self.config.prune_completed_hours * 3600
+        return float(self.config.prune_completed_seconds)
+
+    @property
+    def failed_threshold(self) -> float:
+        if self.config.prune_failed_hours > 0:
+            return self.config.prune_failed_hours * 3600
+        return float(self.config.prune_other_seconds)
+
+    @property
+    def cancelled_threshold(self) -> float:
+        if self.config.prune_cancelled_hours > 0:
+            return self.config.prune_cancelled_hours * 3600
+        return float(self.config.prune_other_seconds)
+
+    @property
+    def metrics_threshold(self) -> float:
+        if self.config.prune_metrics_hours > 0:
+            return self.config.prune_metrics_hours * 3600
+        return float(self.config.prune_metrics_seconds)
+
     async def prune_once(self) -> dict[str, int]:
         """Run a single prune pass based on config."""
         results: dict[str, int] = {}
 
-        if self.config.prune_completed_hours > 0:
-            count = await self.driver.prune(
+        if self.completed_threshold > 0:
+            results["completed"] = await self.driver.prune(
                 status="completed",
-                older_than_seconds=self.config.prune_completed_hours * 3600,
+                older_than_seconds=self.completed_threshold,
             )
-            results["completed"] = count
 
-        if self.config.prune_failed_hours > 0:
-            count = await self.driver.prune(
+        if self.failed_threshold > 0:
+            results["failed"] = await self.driver.prune(
                 status="failed",
-                older_than_seconds=self.config.prune_failed_hours * 3600,
+                older_than_seconds=self.failed_threshold,
             )
-            results["failed"] = count
 
-        if self.config.prune_cancelled_hours > 0:
-            count = await self.driver.prune(
+        if self.cancelled_threshold > 0:
+            results["cancelled"] = await self.driver.prune(
                 status="cancelled",
-                older_than_seconds=self.config.prune_cancelled_hours * 3600,
+                older_than_seconds=self.cancelled_threshold,
             )
-            results["cancelled"] = count
 
-        if self.config.prune_metrics_hours > 0:
-            count = await self.driver.prune_metrics(
-                older_than_seconds=self.config.prune_metrics_hours * 3600,
+        if self.metrics_threshold > 0:
+            results["metrics"] = await self.driver.prune_metrics(
+                older_than_seconds=self.metrics_threshold,
             )
-            results["metrics"] = count
 
         total = sum(results.values())
         if total > 0:
@@ -80,17 +104,25 @@ class Pruner:
             logger.info("Pruned %d jobs with status '%s'", count, status)
         return count
 
-    async def start(self, interval_minutes: int = 60) -> None:
-        """Start automatic pruning loop."""
-        self._running = True
-        logger.info("Pruner started (every %d minutes)", interval_minutes)
+    async def start(self, interval_seconds: float | None = None) -> None:
+        """Start automatic pruning loop. Uses config.prune_interval_seconds by default."""
+        if interval_seconds is None:
+            interval_seconds = float(self.config.prune_interval_seconds)
+        interval_seconds = max(1.0, float(interval_seconds))
 
-        while self._running:
-            try:
-                await self.prune_once()
-            except Exception:
-                logger.exception("Error during prune cycle")
-            await asyncio.sleep(interval_minutes * 60)
+        self._running = True
+        logger.info("Pruner started (every %.0fs)", interval_seconds)
+
+        try:
+            while self._running:
+                try:
+                    await self.prune_once()
+                except Exception:
+                    logger.exception("Error during prune cycle")
+                await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            self._running = False
+            raise
 
     def stop(self) -> None:
         self._running = False

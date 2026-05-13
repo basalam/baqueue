@@ -11,6 +11,7 @@ from typing import Any
 from baqueue.config import SupervisorConfig
 from baqueue.drivers.base import BaseDriver
 from baqueue.events import EventBus
+from baqueue.pruner import Pruner
 from baqueue.worker import Worker
 
 logger = logging.getLogger("baqueue.supervisor")
@@ -28,17 +29,20 @@ class Supervisor:
         config: SupervisorConfig | None = None,
         events: EventBus | None = None,
         balancer: Any | None = None,
+        pruner: Pruner | None = None,
     ):
         self.driver = driver
         self.config = config or SupervisorConfig()
         self.events = events or EventBus.default()
         self.balancer = balancer
+        self.pruner = pruner
         self._workers: list[Worker] = []
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._delayed_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._balance_task: asyncio.Task | None = None
+        self._pruner_task: asyncio.Task | None = None
 
     @property
     def is_running(self) -> bool:
@@ -80,6 +84,9 @@ class Supervisor:
         if self.balancer:
             self._balance_task = asyncio.create_task(self._balance_loop())
 
+        if self.pruner:
+            self._pruner_task = asyncio.create_task(self.pruner.start())
+
         try:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         except asyncio.CancelledError:
@@ -94,19 +101,28 @@ class Supervisor:
         for w in self._workers:
             w.stop()
 
+        if self.pruner:
+            self.pruner.stop()
+
         if self._delayed_task:
             self._delayed_task.cancel()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
         if self._balance_task:
             self._balance_task.cancel()
+        if self._pruner_task:
+            self._pruner_task.cancel()
 
-        aux_tasks = [t for t in (self._delayed_task, self._heartbeat_task, self._balance_task) if t is not None]
+        aux_tasks = [
+            t for t in (self._delayed_task, self._heartbeat_task, self._balance_task, self._pruner_task)
+            if t is not None
+        ]
         if aux_tasks:
             await asyncio.gather(*aux_tasks, return_exceptions=True)
         self._delayed_task = None
         self._heartbeat_task = None
         self._balance_task = None
+        self._pruner_task = None
 
         for task in self._tasks:
             task.cancel()

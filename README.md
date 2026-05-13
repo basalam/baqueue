@@ -13,6 +13,7 @@ A powerful Python queue management package. Multi-driver support, batch jobs, sc
 ## Features
 - **Multi-driver**: SQLite (default), Redis, PostgreSQL, or In-Memory
 - **Auto-balancing**: Dynamically scale workers based on queue pressure
+- **Auto-pruning**: Completed jobs are deleted 30 min after they finish; failed/cancelled jobs are kept up to 1 day — all configurable
 - **Pruning**: Remove old jobs by status, tag, or age
 - **Monitoring Dashboard**: Real-time WebSocket-powered UI with date filtering
 - **CLI**: Manage workers, scheduler, dashboard, and pruning from the command line
@@ -123,6 +124,51 @@ baqueue work -q emails -q payments -w 3 -b auto
 ```
 
 ### Pruning
+
+#### Auto-pruning (runs alongside `baqueue work`)
+
+When `baqueue work` is running, a background pruner cycles every 60s and applies these defaults across every driver:
+
+| Status              | Default lifetime | Config field                |
+|---------------------|------------------|-----------------------------|
+| `completed`         | 30 minutes       | `prune_completed_seconds`   |
+| `failed`, `cancelled` | 1 day          | `prune_other_seconds`       |
+| metrics rows        | 7 days           | `prune_metrics_seconds`     |
+| pruner cycle        | every 60s        | `prune_interval_seconds`    |
+| enable/disable      | `True`           | `auto_prune`                |
+
+Override from a JSON config file (`baqueue -c config.json work`):
+
+```json
+{
+  "auto_prune": true,
+  "prune_completed_seconds": 600,
+  "prune_other_seconds": 172800,
+  "prune_interval_seconds": 30
+}
+```
+
+Or from Python:
+
+```python
+from baqueue import BaQueueConfig
+config = BaQueueConfig(
+    prune_completed_seconds=600,    # 10 minutes
+    prune_other_seconds=172800,     # 2 days
+    prune_interval_seconds=30,
+)
+```
+
+Or from the CLI:
+
+```bash
+baqueue work --prune-completed-seconds 600 --prune-other-seconds 172800
+baqueue work --no-auto-prune              # disable the background pruner
+```
+
+The legacy hour-based fields (`prune_completed_hours`, `prune_failed_hours`, `prune_cancelled_hours`, `prune_metrics_hours`) are still respected for backward compatibility — when set to a positive value they override the corresponding `*_seconds` field.
+
+#### Manual pruning
 
 ```python
 # Remove completed jobs older than 24 hours

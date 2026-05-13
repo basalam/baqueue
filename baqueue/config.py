@@ -52,10 +52,21 @@ class BaQueueConfig(BaseModel):
     dashboard_port: int = 9100
     dashboard_host: str = "0.0.0.0"
     metrics_trim_minutes: int = 1440  # 24 hours
-    prune_completed_hours: int = 24
-    prune_failed_hours: int = 168  # 7 days
-    prune_cancelled_hours: int = 24
-    prune_metrics_hours: int = 168  # 7 days
+
+    # ── Auto-prune (primary, seconds-based) ─────────────────────
+    auto_prune: bool = True
+    prune_interval_seconds: int = 60
+    prune_completed_seconds: int = 1800  # 30 minutes
+    prune_other_seconds: int = 86400  # 1 day — applies to failed + cancelled
+    prune_metrics_seconds: int = 604800  # 7 days
+
+    # ── Legacy hour-based overrides (kept for back-compat) ──────
+    # When > 0, these take precedence over the seconds fields above for the
+    # corresponding status. Default 0 means "use the *_seconds value".
+    prune_completed_hours: float = 0
+    prune_failed_hours: float = 0
+    prune_cancelled_hours: float = 0
+    prune_metrics_hours: float = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BaQueueConfig:

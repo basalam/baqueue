@@ -86,6 +86,19 @@ def cli(ctx: click.Context, config: str | None, verbose: bool) -> None:
 @click.option("--max-jobs", default=0, help="Max jobs per worker (0 = unlimited).")
 @click.option("--driver", "-d", default="sqlite", help="Driver name (sqlite, memory, redis, postgres).")
 @click.option("--driver-url", default=None, help="Driver connection URL.")
+@click.option("--no-auto-prune", is_flag=True, help="Disable the background auto-pruner.")
+@click.option(
+    "--prune-completed-seconds", type=int, default=None,
+    help="Override: delete completed jobs older than N seconds (default 1800).",
+)
+@click.option(
+    "--prune-other-seconds", type=int, default=None,
+    help="Override: delete failed/cancelled jobs older than N seconds (default 86400).",
+)
+@click.option(
+    "--prune-interval-seconds", type=int, default=None,
+    help="Override: how often the auto-pruner runs, in seconds (default 60).",
+)
 @click.pass_context
 def work(
     ctx: click.Context,
@@ -97,10 +110,23 @@ def work(
     max_jobs: int,
     driver: str,
     driver_url: str | None,
+    no_auto_prune: bool,
+    prune_completed_seconds: int | None,
+    prune_other_seconds: int | None,
+    prune_interval_seconds: int | None,
 ) -> None:
     """Start processing jobs."""
     config: BaQueueConfig = ctx.obj["config"]
     config.driver = DriverConfig(name=driver, url=driver_url or "")
+
+    if no_auto_prune:
+        config.auto_prune = False
+    if prune_completed_seconds is not None:
+        config.prune_completed_seconds = prune_completed_seconds
+    if prune_other_seconds is not None:
+        config.prune_other_seconds = prune_other_seconds
+    if prune_interval_seconds is not None:
+        config.prune_interval_seconds = prune_interval_seconds
 
     supervisor_config = SupervisorConfig(
         queues=list(queue),
@@ -119,6 +145,13 @@ def work(
     click.echo(f"  Queues:  {', '.join(queue)}")
     click.echo(f"  Workers: {workers}")
     click.echo(f"  Balance: {balance}")
+    if config.auto_prune:
+        click.echo(
+            f"  Auto-prune: completed>{config.prune_completed_seconds}s, "
+            f"other>{config.prune_other_seconds}s, every {config.prune_interval_seconds}s"
+        )
+    else:
+        click.echo("  Auto-prune: disabled")
     click.echo()
 
     _run_async(_run_worker, config, supervisor_config)
@@ -126,6 +159,7 @@ def work(
 
 async def _run_worker(config: BaQueueConfig, supervisor_config: SupervisorConfig) -> None:
     from baqueue.balancer import create_balancer
+    from baqueue.pruner import Pruner
     from baqueue.supervisor import Supervisor
 
     Queue.configure(config)
@@ -136,10 +170,12 @@ async def _run_worker(config: BaQueueConfig, supervisor_config: SupervisorConfig
         min_workers=supervisor_config.min_workers,
         max_workers=supervisor_config.max_workers,
     )
+    pruner = Pruner(driver=Queue.get_driver(), config=config) if config.auto_prune else None
     supervisor = Supervisor(
         driver=Queue.get_driver(),
         config=supervisor_config,
         balancer=balancer,
+        pruner=pruner,
     )
 
     try:
