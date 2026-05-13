@@ -10,6 +10,31 @@ A powerful Python queue management package. Multi-driver support, batch jobs, sc
 ### Queues - Per-queue detail cards with pending/processing/completed/failed
 ![Queues](./baqueue/screen/3.png)
 
+## Table of Contents
+
+- [Features](#features)
+- [Quick Start](#quick-start)
+  - [Define a Job](#define-a-job)
+  - [Dispatch Jobs](#dispatch-jobs)
+  - [Batch Jobs](#batch-jobs)
+  - [Run Workers](#run-workers)
+  - [Pruning](#pruning)
+    - [Auto-pruning](#auto-pruning-runs-alongside-baqueue-work)
+    - [Manual pruning](#manual-pruning)
+  - [Retry Failed Jobs](#retry-failed-jobs)
+  - [Dashboard](#dashboard)
+    - [Workers Tab (Supervisor/Worker Monitoring)](#workers-tab-supervisorworker-monitoring)
+  - [Drivers](#drivers)
+- [Examples](#examples)
+- [Testing](#testing)
+- [CLI Commands](#cli-commands)
+- [Benchmarks](#benchmarks)
+  - [Test 1: 1,000 jobs / 5 workers](#test-1-1000-jobs--5-workers)
+  - [Test 2: 5,000 jobs / 10 workers](#test-2-5000-jobs--10-workers)
+  - [Stress Test Options](#stress-test-options)
+  - [Run with Live Dashboard](#run-with-live-dashboard)
+- [License](#license)
+
 ## Features
 - **Multi-driver**: SQLite (default), Redis, PostgreSQL, or In-Memory
 - **Auto-balancing**: Dynamically scale workers based on queue pressure
