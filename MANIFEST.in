@@ -1,0 +1,19 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+# Ship the dashboard's bundled static assets in the source distribution.
+recursive-include baqueue/dashboard/static *
+
+# Keep build/test/runtime artifacts out of the sdist.
+global-exclude *.py[cod]
+global-exclude __pycache__/*
+prune tests
+prune examples
+prune .github
+exclude .baqueue.db
+exclude AGENTS.md
+global-exclude *.db
+global-exclude *.db-shm
+global-exclude *.db-wal
+global-exclude *.db-journal

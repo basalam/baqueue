@@ -1,5 +1,10 @@
 # BaQueue
 
+[![PyPI version](https://img.shields.io/pypi/v/baqueue.svg)](https://pypi.org/project/baqueue/)
+[![Python versions](https://img.shields.io/pypi/pyversions/baqueue.svg)](https://pypi.org/project/baqueue/)
+[![License: MIT](https://img.shields.io/pypi/l/baqueue.svg)](https://github.com/basalam/baqueue/blob/master/LICENSE)
+[![CI](https://github.com/basalam/baqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/basalam/baqueue/actions/workflows/ci.yml)
+
 A powerful Python queue management package. Multi-driver support, batch jobs, scheduling, auto-balancing, and a beautiful real-time monitoring dashboard.
 
 ![Overview](./baqueue/screen/1.png)
@@ -48,21 +53,28 @@ A powerful Python queue management package. Multi-driver support, batch jobs, sc
 ## Quick Start
 
 ```bash
-# Install (SQLite driver works out of the box, zero dependencies)
-pip install -e .
+# Install (SQLite + in-memory drivers work out of the box, zero extra dependencies)
+pip install baqueue
 
 # With Redis support
-pip install -e ".[redis]"
+pip install "baqueue[redis]"
 
 # With PostgreSQL support
-pip install -e ".[postgres]"
+pip install "baqueue[postgres]"
 
 # With dashboard
-pip install -e ".[dashboard]"
+pip install "baqueue[dashboard]"
 
 # Everything
-pip install -e ".[all]"
+pip install "baqueue[all]"
 ```
+
+> **Installing from source (development):**
+> ```bash
+> git clone https://github.com/basalam/baqueue.git
+> cd baqueue
+> pip install -e ".[dev]"   # editable install with all extras + test/build tooling
+> ```
 
 ### Define a Job
 
@@ -543,4 +555,4 @@ python examples/stress_test.py --jobs 3000 --workers 8 --bulk --dashboard
 
 ## License
 
-MIT
+[MIT](./LICENSE) © Basalam and BaQueue Contributors
