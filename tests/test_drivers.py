@@ -221,10 +221,32 @@ class TestMetrics:
         await driver.push(_make_payload(queue="x"))
         m = await driver.get_metrics()
         assert isinstance(m, dict)
-        # The exact key set varies a bit by driver, but at minimum
-        # the queue we touched should be tracked once any metric or
-        # job exists in it.
-        # SQLite/Memory both report queues seen via jobs in the snapshot.
+        assert "x" in m
+
+    async def test_get_metrics_reports_live_job_status_counts(self, driver):
+        pending = _make_payload(queue="x")
+        completed = _make_payload(queue="x")
+        failed = _make_payload(queue="x")
+        other_queue = _make_payload(queue="y")
+
+        await driver.push(pending)
+        await driver.push(completed)
+        await driver.push(failed)
+        await driver.push(other_queue)
+        await driver.complete(completed)
+        await driver.fail(failed, "boom")
+
+        # Extra metric events must not inflate live Overview counters.
+        await driver.record_metric("x", "completed", 1)
+        await driver.record_metric("x", "completed", 1)
+        await driver.record_metric("x", "failed", 1)
+
+        m = await driver.get_metrics()
+        assert isinstance(m, dict)
+        assert m["x"]["pending"] == 1
+        assert m["x"]["completed"] == 1
+        assert m["x"]["failed"] == 1
+        assert m["y"]["pending"] == 1
 
 
 class TestSupervisorReporting:

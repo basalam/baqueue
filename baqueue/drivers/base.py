@@ -2,14 +2,65 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from baqueue.serializer import JobPayload
+
+logger = logging.getLogger("baqueue.driver")
 
 
 class BaseDriver(ABC):
     """Every BaQueue driver must implement this interface."""
+
+    # When True, write operations that fail with a storage-full error trigger
+    # an emergency cleanup and one retry. Wired from BaQueueConfig in queue.py.
+    auto_cleanup_on_disk_full: bool = True
+
+    # Re-entrancy guard so emergency_cleanup() doesn't recurse if its own
+    # prune calls also hit disk-full.
+    _in_emergency_cleanup: bool = False
+
+    def is_storage_full_error(self, exc: BaseException) -> bool:
+        """Subclasses override to detect their driver-specific storage-exhausted errors
+        (SQLite "database or disk is full", Postgres disk_full, Redis OOM, etc.)."""
+        return False
+
+    async def emergency_cleanup(self) -> int:
+        """Aggressively free space: purge every terminal job + old metrics.
+        Returns the count of removed entries. Subclasses may override for
+        a more targeted sweep."""
+        total = 0
+        for status in ("completed", "failed", "cancelled"):
+            try:
+                total += await self.prune(status=status)
+            except Exception:
+                logger.exception("emergency_cleanup: prune(status=%s) failed", status)
+        try:
+            total += await self.prune_metrics(older_than_seconds=0)
+        except Exception:
+            logger.exception("emergency_cleanup: prune_metrics failed")
+        logger.warning("emergency_cleanup removed %d entries due to storage pressure", total)
+        return total
+
+    async def _with_disk_full_recovery(self, fn: Callable[[], Awaitable[Any]]) -> Any:
+        """Run an async write; on storage-full error, run emergency cleanup once and retry.
+        Drivers wrap their write paths with this helper."""
+        if not self.auto_cleanup_on_disk_full or self._in_emergency_cleanup:
+            return await fn()
+        try:
+            return await fn()
+        except Exception as e:
+            if not self.is_storage_full_error(e):
+                raise
+            logger.warning("Storage-full error caught: %s. Running emergency cleanup.", e)
+            self._in_emergency_cleanup = True
+            try:
+                await self.emergency_cleanup()
+            finally:
+                self._in_emergency_cleanup = False
+            return await fn()
 
     @abstractmethod
     async def connect(self) -> None: ...

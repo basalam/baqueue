@@ -34,11 +34,7 @@ async def _fail(driver, payload):
 class TestOverview:
     async def test_overview_shape(self):
         await Queue.connect()
-        # overview() drives totals off get_metrics(), which in MemoryDriver
-        # only sees queues with a recorded metric event. Record one to make
-        # the queue visible in the snapshot.
         await Queue.push(SimpleJob)
-        await Queue.get_driver().record_metric("dapi_test", "processing", 1)
         api = DashboardAPI(Queue.get_driver())
         data = await api.overview()
         assert "totals" in data

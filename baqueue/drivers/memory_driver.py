@@ -185,22 +185,25 @@ class MemoryDriver(BaseDriver):
         )
 
     async def get_metrics(self, queue: str | None = None) -> dict[str, Any]:
-        queues_list = [queue] if queue else list(self._metrics.keys())
-        result: dict[str, Any] = {}
-        for q in queues_list:
-            entries = self._metrics.get(q, [])
-            throughput = sum(1 for e in entries if e["metric"] == "completed")
-            failed = sum(1 for e in entries if e["metric"] == "failed")
-            pending = await self.size(q)
-            all_jobs = [j for j in self._jobs.values() if j.queue == q]
-            processing = sum(1 for j in all_jobs if j.status == "processing")
-            result[q] = {
-                "pending": pending,
-                "processing": processing,
-                "completed": throughput,
-                "failed": failed,
-                "total_jobs": len(all_jobs),
-            }
+        """Live status counts from the jobs dict — never from the metrics event log."""
+        if queue:
+            queues_list = [queue]
+        else:
+            seen: set[str] = set(self._queues.keys())
+            for j in self._jobs.values():
+                seen.add(j.queue)
+            queues_list = sorted(seen)
+
+        result: dict[str, Any] = {
+            q: {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+            for q in queues_list
+        }
+        for j in self._jobs.values():
+            counts = result.get(j.queue)
+            if counts is None:
+                continue
+            if j.status in counts:
+                counts[j.status] += 1
         return result
 
     async def report_supervisor(self, stats: dict[str, Any]) -> None:

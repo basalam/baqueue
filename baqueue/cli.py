@@ -89,7 +89,7 @@ def cli(ctx: click.Context, config: str | None, verbose: bool) -> None:
 @click.option("--no-auto-prune", is_flag=True, help="Disable the background auto-pruner.")
 @click.option(
     "--prune-completed-seconds", type=int, default=None,
-    help="Override: delete completed jobs older than N seconds (default 1800).",
+    help="Override: delete completed jobs older than N seconds (default 5).",
 )
 @click.option(
     "--prune-other-seconds", type=int, default=None,
@@ -97,7 +97,11 @@ def cli(ctx: click.Context, config: str | None, verbose: bool) -> None:
 )
 @click.option(
     "--prune-interval-seconds", type=int, default=None,
-    help="Override: how often the auto-pruner runs, in seconds (default 60).",
+    help="Override: how often the auto-pruner runs, in seconds (default 5).",
+)
+@click.option(
+    "--no-disk-full-cleanup", is_flag=True,
+    help="Disable automatic emergency cleanup when the driver returns a disk-full error.",
 )
 @click.pass_context
 def work(
@@ -114,6 +118,7 @@ def work(
     prune_completed_seconds: int | None,
     prune_other_seconds: int | None,
     prune_interval_seconds: int | None,
+    no_disk_full_cleanup: bool,
 ) -> None:
     """Start processing jobs."""
     config: BaQueueConfig = ctx.obj["config"]
@@ -127,6 +132,8 @@ def work(
         config.prune_other_seconds = prune_other_seconds
     if prune_interval_seconds is not None:
         config.prune_interval_seconds = prune_interval_seconds
+    if no_disk_full_cleanup:
+        config.auto_cleanup_on_disk_full = False
 
     supervisor_config = SupervisorConfig(
         queues=list(queue),
@@ -152,6 +159,9 @@ def work(
         )
     else:
         click.echo("  Auto-prune: disabled")
+    click.echo(
+        f"  Disk-full cleanup: {'enabled' if config.auto_cleanup_on_disk_full else 'disabled'}"
+    )
     click.echo()
 
     _run_async(_run_worker, config, supervisor_config)

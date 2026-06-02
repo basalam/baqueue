@@ -28,6 +28,8 @@ class Queue:
     @classmethod
     def configure(cls, config: BaQueueConfig | None = None, driver: BaseDriver | None = None) -> None:
         cls._config = config or BaQueueConfig()
+        if driver is not None:
+            driver.auto_cleanup_on_disk_full = cls._config.auto_cleanup_on_disk_full
         cls._driver = driver
         cls._events = EventBus.default()
 
@@ -194,11 +196,11 @@ def _build_payload(job: Type[Job] | Job | FunctionJob, kwargs: dict[str, Any]) -
 def _create_driver(config: BaQueueConfig) -> BaseDriver:
     name = config.driver.name
     if name == "memory":
-        return MemoryDriver()
+        driver: BaseDriver = MemoryDriver()
     elif name == "sqlite":
         from baqueue.drivers.sqlite_driver import SqliteDriver
         path = config.driver.url or ".baqueue.db"
-        return SqliteDriver(path=path, **config.driver.options)
+        driver = SqliteDriver(path=path, **config.driver.options)
     elif name == "redis":
         try:
             from baqueue.drivers.redis_driver import RedisDriver
@@ -207,7 +209,7 @@ def _create_driver(config: BaQueueConfig) -> BaseDriver:
                 "Redis driver requires the 'redis' package.\n"
                 "Install it with: pip install baqueue[redis]"
             ) from None
-        return RedisDriver(config.driver.url, prefix=config.prefix, **config.driver.options)
+        driver = RedisDriver(config.driver.url, prefix=config.prefix, **config.driver.options)
     elif name == "postgres":
         try:
             from baqueue.drivers.postgres_driver import PostgresDriver
@@ -216,6 +218,8 @@ def _create_driver(config: BaQueueConfig) -> BaseDriver:
                 "PostgreSQL driver requires the 'asyncpg' package.\n"
                 "Install it with: pip install baqueue[postgres]"
             ) from None
-        return PostgresDriver(config.driver.url, prefix=config.prefix, **config.driver.options)
+        driver = PostgresDriver(config.driver.url, prefix=config.prefix, **config.driver.options)
     else:
         raise ValueError(f"Unknown driver: {name}")
+    driver.auto_cleanup_on_disk_full = config.auto_cleanup_on_disk_full
+    return driver

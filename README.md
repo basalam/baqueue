@@ -38,7 +38,8 @@ A powerful Python queue management package. Multi-driver support, batch jobs, sc
 ## Features
 - **Multi-driver**: SQLite (default), Redis, PostgreSQL, or In-Memory
 - **Auto-balancing**: Dynamically scale workers based on queue pressure
-- **Auto-pruning**: Completed jobs are deleted 30 min after they finish; failed/cancelled jobs are kept up to 1 day — all configurable
+- **Auto-pruning**: Completed jobs are deleted about 5 seconds after they finish; failed/cancelled jobs are kept up to 1 day — all configurable
+- **Disk-full cleanup**: Storage-full/OOM driver errors trigger emergency cleanup of terminal jobs and old metrics, then retry once
 - **Pruning**: Remove old jobs by status, tag, or age
 - **Monitoring Dashboard**: Real-time WebSocket-powered UI with date filtering
 - **CLI**: Manage workers, scheduler, dashboard, and pruning from the command line
@@ -152,14 +153,14 @@ baqueue work -q emails -q payments -w 3 -b auto
 
 #### Auto-pruning (runs alongside `baqueue work`)
 
-When `baqueue work` is running, a background pruner cycles every 60s and applies these defaults across every driver:
+When `baqueue work` is running, a background pruner cycles every 5s and applies these defaults across every driver:
 
 | Status              | Default lifetime | Config field                |
 |---------------------|------------------|-----------------------------|
-| `completed`         | 30 minutes       | `prune_completed_seconds`   |
+| `completed`         | 5 seconds        | `prune_completed_seconds`   |
 | `failed`, `cancelled` | 1 day          | `prune_other_seconds`       |
 | metrics rows        | 7 days           | `prune_metrics_seconds`     |
-| pruner cycle        | every 60s        | `prune_interval_seconds`    |
+| pruner cycle        | every 5s         | `prune_interval_seconds`    |
 | enable/disable      | `True`           | `auto_prune`                |
 
 Override from a JSON config file (`baqueue -c config.json work`):
@@ -169,7 +170,8 @@ Override from a JSON config file (`baqueue -c config.json work`):
   "auto_prune": true,
   "prune_completed_seconds": 600,
   "prune_other_seconds": 172800,
-  "prune_interval_seconds": 30
+  "prune_interval_seconds": 30,
+  "auto_cleanup_on_disk_full": true
 }
 ```
 
@@ -181,6 +183,7 @@ config = BaQueueConfig(
     prune_completed_seconds=600,    # 10 minutes
     prune_other_seconds=172800,     # 2 days
     prune_interval_seconds=30,
+    auto_cleanup_on_disk_full=True, # enabled by default
 )
 ```
 
@@ -189,9 +192,14 @@ Or from the CLI:
 ```bash
 baqueue work --prune-completed-seconds 600 --prune-other-seconds 172800
 baqueue work --no-auto-prune              # disable the background pruner
+baqueue work --no-disk-full-cleanup       # disable emergency storage cleanup
 ```
 
 The legacy hour-based fields (`prune_completed_hours`, `prune_failed_hours`, `prune_cancelled_hours`, `prune_metrics_hours`) are still respected for backward compatibility — when set to a positive value they override the corresponding `*_seconds` field.
+
+#### Disk-full emergency cleanup
+
+`auto_cleanup_on_disk_full` is enabled by default. When a driver write/update/delete operation sees a storage-full style error (SQLite disk full, PostgreSQL disk/memory exhausted, Redis OOM/maxmemory), BaQueue runs an emergency cleanup that removes terminal jobs (`completed`, `failed`, `cancelled`) and old metrics, then retries the failed operation once. If cleanup does not free enough space, the original driver error is still raised.
 
 #### Manual pruning
 
@@ -258,7 +266,7 @@ baqueue dashboard
 ```
 
 The dashboard includes:
-- Real-time overview with pending/processing/completed/failed counters
+- Real-time overview with pending/processing/completed/failed counters sourced from live job state (not bounded metric logs)
 - Date range filtering (custom range + presets: 1h, 24h, 7d, 30d)
 - Job detail modal with timeline, payload data, and error trace
 - Queue breakdown with progress bars

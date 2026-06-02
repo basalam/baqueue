@@ -78,12 +78,12 @@ class TestPruner:
         assert results["completed"] == 5
 
     async def test_default_seconds_thresholds(self):
-        """Default config: completed > 30min and failed/cancelled > 1d should prune."""
+        """Default config: completed > 5s and failed/cancelled > 1d should prune."""
         driver = MemoryDriver()
-        # Completed: older than 30 minutes default → prune
-        await _push_with_status(driver, status="completed", age_seconds=1801)
-        # Completed: younger than 30 min → keep
-        await _push_with_status(driver, status="completed", age_seconds=60)
+        # Completed: older than 5 seconds default → prune
+        await _push_with_status(driver, status="completed", age_seconds=6)
+        # Completed: younger than 5 seconds → keep
+        await _push_with_status(driver, status="completed", age_seconds=1)
         # Failed: older than 1 day default → prune
         await _push_with_status(driver, status="failed", age_seconds=86401)
         # Failed: younger than 1 day → keep
@@ -98,9 +98,9 @@ class TestPruner:
         assert results["cancelled"] == 1
 
     async def test_legacy_hours_overrides_seconds(self):
-        """Setting prune_completed_hours overrides the default 30-minute window."""
+        """Setting prune_completed_hours overrides the default 5-second window."""
         driver = MemoryDriver()
-        # 45 min old: would be pruned at 30-min default, but not at 2-hour override
+        # 45 min old: would be pruned at 5-second default, but not at 2-hour override
         await _push_with_status(driver, status="completed", age_seconds=45 * 60)
 
         config = BaQueueConfig(prune_completed_hours=2)

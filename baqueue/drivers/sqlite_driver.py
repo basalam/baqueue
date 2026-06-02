@@ -50,19 +50,76 @@ class SqliteDriver(BaseDriver):
             self._conn.close()
             self._conn = None
 
+    def is_storage_full_error(self, exc: BaseException) -> bool:
+        if not isinstance(exc, sqlite3.OperationalError):
+            return False
+        msg = str(exc).lower()
+        # SQLite raises e.g. "database or disk is full".
+        return (
+            "database or disk is full" in msg
+            or "disk full" in msg
+            or "no space" in msg
+            or "out of memory" in msg
+        )
+
+    async def emergency_cleanup(self) -> int:
+        """Free SQLite space without going through public prune methods.
+
+        SQLite write methods call _execute_with_retry() while holding _lock. The
+        disk-full recovery path therefore uses _emergency_cleanup_locked() so it
+        does not try to re-acquire the same asyncio.Lock and deadlock.
+        """
+        async with self._lock:
+            return await self._emergency_cleanup_locked()
+
+    async def _emergency_cleanup_locked(self) -> int:
+        def _do() -> int:
+            c = self._get_conn()
+            total = 0
+            for status in ("completed", "failed", "cancelled"):
+                cur = c.execute("DELETE FROM jobs WHERE status=?", (status,))
+                total += cur.rowcount
+            cur = c.execute("DELETE FROM metrics WHERE recorded_at < ?", (_now_ts(),))
+            total += cur.rowcount
+            c.commit()
+            return total
+
+        total = await asyncio.to_thread(_do)
+        logger.warning("emergency_cleanup removed %d entries due to storage pressure", total)
+        return total
+
     async def _execute_with_retry(self, fn):
         """Execute a database operation with retry on 'database is locked'.
-        Runs the sync sqlite call in a thread so the asyncio loop is never blocked."""
-        for attempt in range(MAX_RETRIES):
+
+        The caller holds self._lock. Storage-full recovery must stay inside that
+        lock and use raw SQL cleanup to avoid re-entering public prune methods.
+        """
+        async def _attempt():
+            for attempt in range(MAX_RETRIES):
+                try:
+                    return await asyncio.to_thread(fn)
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e) and attempt < MAX_RETRIES - 1:
+                        delay = RETRY_BASE_DELAY * (2 ** attempt)
+                        logger.debug("Database locked, retry %d/%d in %.2fs", attempt + 1, MAX_RETRIES, delay)
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+
+        if not self.auto_cleanup_on_disk_full or self._in_emergency_cleanup:
+            return await _attempt()
+        try:
+            return await _attempt()
+        except Exception as e:
+            if not self.is_storage_full_error(e):
+                raise
+            logger.warning("Storage-full error caught: %s. Running emergency cleanup.", e)
+            self._in_emergency_cleanup = True
             try:
-                return await asyncio.to_thread(fn)
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e) and attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.debug("Database locked, retry %d/%d in %.2fs", attempt + 1, MAX_RETRIES, delay)
-                    await asyncio.sleep(delay)
-                else:
-                    raise
+                await self._emergency_cleanup_locked()
+            finally:
+                self._in_emergency_cleanup = False
+            return await _attempt()
 
     async def _run(self, fn):
         """Run a sync read-only sqlite call off the event loop.
@@ -426,43 +483,34 @@ class SqliteDriver(BaseDriver):
             await self._execute_with_retry(_do)
 
     async def get_metrics(self, queue: str | None = None) -> dict[str, Any]:
+        """Live status counts from the jobs table — never from the metrics event log.
+        Counting from metrics caused the Overview "Total Jobs" to shrink over time
+        as old metric rows aged out and to plateau when metric storage filled up."""
         def _do() -> dict[str, Any]:
             c = self._get_conn()
             if queue:
-                metric_rows = c.execute(
-                    "SELECT queue, metric, COUNT(*) as cnt FROM metrics WHERE queue=? GROUP BY queue, metric",
+                status_rows = c.execute(
+                    "SELECT queue, status, COUNT(*) AS cnt FROM jobs WHERE queue=? GROUP BY queue, status",
                     (queue,),
                 ).fetchall()
-                queue_rows = [{"queue": queue}]
+                queue_names = [queue]
             else:
-                metric_rows = c.execute(
-                    "SELECT queue, metric, COUNT(*) as cnt FROM metrics GROUP BY queue, metric"
+                status_rows = c.execute(
+                    "SELECT queue, status, COUNT(*) AS cnt FROM jobs GROUP BY queue, status"
                 ).fetchall()
-                queue_rows = c.execute(
-                    "SELECT DISTINCT queue FROM jobs ORDER BY queue"
-                ).fetchall()
+                qrows = c.execute("SELECT DISTINCT queue FROM jobs ORDER BY queue").fetchall()
+                queue_names = [r["queue"] for r in qrows]
 
-            result: dict[str, Any] = {}
-            for r in metric_rows:
+            result: dict[str, Any] = {
+                q: {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+                for q in queue_names
+            }
+            for r in status_rows:
                 q = r["queue"]
                 if q not in result:
                     result[q] = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
-                result[q][r["metric"]] = r["cnt"]
-
-            for qr in queue_rows:
-                q = qr["queue"]
-                if q not in result:
-                    result[q] = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
-                state_row = c.execute(
-                    """SELECT
-                           SUM(CASE WHEN status='pending'    THEN 1 ELSE 0 END) AS pending,
-                           SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) AS processing
-                       FROM jobs WHERE queue=?""",
-                    (q,),
-                ).fetchone()
-                result[q]["pending"] = state_row["pending"] or 0
-                result[q]["processing"] = state_row["processing"] or 0
-
+                if r["status"] in result[q]:
+                    result[q][r["status"]] = r["cnt"]
             return result
 
         return await self._run(_do)

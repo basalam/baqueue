@@ -24,6 +24,22 @@ class PostgresDriver(BaseDriver):
         self._kwargs = kwargs
         self._pool: Any = None
 
+    # Postgres sqlstate codes for storage exhaustion. asyncpg surfaces these on
+    # the exception's `sqlstate` attribute.
+    _STORAGE_SQLSTATES = frozenset({"53100", "53200", "53300", "54000"})
+
+    def is_storage_full_error(self, exc: BaseException) -> bool:
+        sqlstate = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+        if sqlstate in self._STORAGE_SQLSTATES:
+            return True
+        msg = str(exc).lower()
+        return (
+            "disk full" in msg
+            or "no space left" in msg
+            or "out of memory" in msg
+            or "could not extend file" in msg
+        )
+
     @property
     def _jobs_table(self) -> str:
         return f"{self._prefix}_jobs"
@@ -173,95 +189,117 @@ class PostgresDriver(BaseDriver):
         payload.updated_at = _now_ts()
         backoff_str = json.dumps(payload.backoff) if isinstance(payload.backoff, list) else payload.backoff
 
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"""INSERT INTO {self._jobs_table}
-                    (id, job_class, data, queue, status, attempts, max_attempts,
-                     backoff, timeout, tags, batch_id, delay_until, created_at, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
-                payload.id, payload.job_class, json.dumps(payload.data),
-                payload.queue, payload.status, payload.attempts, payload.max_attempts,
-                backoff_str, payload.timeout, payload.tags,
-                payload.batch_id, payload.delay_until,
-                payload.created_at, payload.updated_at,
-            )
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"""INSERT INTO {self._jobs_table}
+                        (id, job_class, data, queue, status, attempts, max_attempts,
+                         backoff, timeout, tags, batch_id, delay_until, created_at, updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+                    payload.id, payload.job_class, json.dumps(payload.data),
+                    payload.queue, payload.status, payload.attempts, payload.max_attempts,
+                    backoff_str, payload.timeout, payload.tags,
+                    payload.batch_id, payload.delay_until,
+                    payload.created_at, payload.updated_at,
+                )
+        await self._with_disk_full_recovery(_do)
         return payload.id
 
     async def push_many(self, payloads: list[JobPayload]) -> list[str]:
-        ids = []
+        ids: list[str] = []
         now = _now_ts()
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                for p in payloads:
-                    p.status = "pending"
-                    p.updated_at = now
-                    backoff_str = json.dumps(p.backoff) if isinstance(p.backoff, list) else p.backoff
-                    await conn.execute(
-                        f"""INSERT INTO {self._jobs_table}
-                            (id, job_class, data, queue, status, attempts, max_attempts,
-                             backoff, timeout, tags, batch_id, delay_until, created_at, updated_at)
-                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
-                        p.id, p.job_class, json.dumps(p.data),
-                        p.queue, p.status, p.attempts, p.max_attempts,
-                        backoff_str, p.timeout, p.tags,
-                        p.batch_id, p.delay_until,
-                        p.created_at, p.updated_at,
-                    )
-                    ids.append(p.id)
+
+        async def _do():
+            ids.clear()
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    for p in payloads:
+                        p.status = "pending"
+                        p.updated_at = now
+                        backoff_str = json.dumps(p.backoff) if isinstance(p.backoff, list) else p.backoff
+                        await conn.execute(
+                            f"""INSERT INTO {self._jobs_table}
+                                (id, job_class, data, queue, status, attempts, max_attempts,
+                                 backoff, timeout, tags, batch_id, delay_until, created_at, updated_at)
+                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+                            p.id, p.job_class, json.dumps(p.data),
+                            p.queue, p.status, p.attempts, p.max_attempts,
+                            backoff_str, p.timeout, p.tags,
+                            p.batch_id, p.delay_until,
+                            p.created_at, p.updated_at,
+                        )
+                        ids.append(p.id)
+        await self._with_disk_full_recovery(_do)
         return ids
 
     async def pop(self, queue: str) -> JobPayload | None:
         now = _now_ts()
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""UPDATE {self._jobs_table}
-                    SET status='processing', started_at=$1, updated_at=$1, attempts=attempts+1
-                    WHERE id = (
-                        SELECT id FROM {self._jobs_table}
-                        WHERE queue=$2 AND status='pending'
-                          AND (delay_until IS NULL OR delay_until <= $1)
-                        ORDER BY created_at ASC
-                        FOR UPDATE SKIP LOCKED
-                        LIMIT 1
-                    )
-                    RETURNING *""",
-                now, queue,
-            )
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                return await conn.fetchrow(
+                    f"""UPDATE {self._jobs_table}
+                        SET status='processing', started_at=$1, updated_at=$1, attempts=attempts+1
+                        WHERE id = (
+                            SELECT id FROM {self._jobs_table}
+                            WHERE queue=$2 AND status='pending'
+                              AND (delay_until IS NULL OR delay_until <= $1)
+                            ORDER BY created_at ASC
+                            FOR UPDATE SKIP LOCKED
+                            LIMIT 1
+                        )
+                        RETURNING *""",
+                    now, queue,
+                )
+
+        row = await self._with_disk_full_recovery(_do)
         if row:
             return self._row_to_payload(row)
         return None
 
     async def pop_delayed(self) -> list[JobPayload]:
         now = _now_ts()
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"""UPDATE {self._jobs_table}
-                    SET delay_until=NULL, updated_at=$1
-                    WHERE status='pending' AND delay_until IS NOT NULL AND delay_until <= $1
-                    RETURNING *""",
-                now,
-            )
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                return await conn.fetch(
+                    f"""UPDATE {self._jobs_table}
+                        SET delay_until=NULL, updated_at=$1
+                        WHERE status='pending' AND delay_until IS NOT NULL AND delay_until <= $1
+                        RETURNING *""",
+                    now,
+                )
+
+        rows = await self._with_disk_full_recovery(_do)
         return [self._row_to_payload(r) for r in rows]
 
     # ── Job lifecycle ───────────────────────────────────────────
 
     async def complete(self, payload: JobPayload) -> None:
         now = _now_ts()
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE {self._jobs_table} SET status='completed', completed_at=$1, updated_at=$1 WHERE id=$2",
-                now, payload.id,
-            )
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE {self._jobs_table} SET status='completed', completed_at=$1, updated_at=$1 WHERE id=$2",
+                    now, payload.id,
+                )
+
+        await self._with_disk_full_recovery(_do)
         payload.status = "completed"
         payload.completed_at = now
 
     async def fail(self, payload: JobPayload, error: str) -> None:
         now = _now_ts()
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE {self._jobs_table} SET status='failed', failed_at=$1, updated_at=$1, error=$2 WHERE id=$3",
-                now, error, payload.id,
-            )
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE {self._jobs_table} SET status='failed', failed_at=$1, updated_at=$1, error=$2 WHERE id=$3",
+                    now, error, payload.id,
+                )
+
+        await self._with_disk_full_recovery(_do)
         payload.status = "failed"
         payload.failed_at = now
         payload.error = error
@@ -269,15 +307,22 @@ class PostgresDriver(BaseDriver):
     async def release(self, payload: JobPayload, delay: float = 0) -> None:
         now = _now_ts()
         delay_until = now + delay if delay > 0 else None
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE {self._jobs_table} SET status='pending', updated_at=$1, delay_until=$2 WHERE id=$3",
-                now, delay_until, payload.id,
-            )
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE {self._jobs_table} SET status='pending', updated_at=$1, delay_until=$2 WHERE id=$3",
+                    now, delay_until, payload.id,
+                )
+
+        await self._with_disk_full_recovery(_do)
 
     async def delete(self, job_id: str) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(f"DELETE FROM {self._jobs_table} WHERE id=$1", job_id)
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(f"DELETE FROM {self._jobs_table} WHERE id=$1", job_id)
+
+        await self._with_disk_full_recovery(_do)
 
     # ── Query ───────────────────────────────────────────────────
 
@@ -385,34 +430,43 @@ class PostgresDriver(BaseDriver):
     # ── Metrics ─────────────────────────────────────────────────
 
     async def record_metric(self, queue: str, metric: str, value: float) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"INSERT INTO {self._metrics_table} (queue, metric, value, recorded_at) VALUES ($1,$2,$3,$4)",
-                queue, metric, value, _now_ts(),
-            )
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"INSERT INTO {self._metrics_table} (queue, metric, value, recorded_at) VALUES ($1,$2,$3,$4)",
+                    queue, metric, value, _now_ts(),
+                )
+        await self._with_disk_full_recovery(_do)
 
     async def get_metrics(self, queue: str | None = None) -> dict[str, Any]:
+        """Live status counts from the jobs table — never from the metrics event log."""
         async with self._pool.acquire() as conn:
             if queue:
                 rows = await conn.fetch(
-                    f"SELECT queue, metric, COUNT(*) as cnt FROM {self._metrics_table} WHERE queue=$1 GROUP BY queue, metric",
+                    f"SELECT queue, status, COUNT(*) AS cnt FROM {self._jobs_table} "
+                    f"WHERE queue=$1 GROUP BY queue, status",
                     queue,
                 )
+                queue_names = [queue]
             else:
                 rows = await conn.fetch(
-                    f"SELECT queue, metric, COUNT(*) as cnt FROM {self._metrics_table} GROUP BY queue, metric"
+                    f"SELECT queue, status, COUNT(*) AS cnt FROM {self._jobs_table} GROUP BY queue, status"
                 )
+                qrows = await conn.fetch(
+                    f"SELECT DISTINCT queue FROM {self._jobs_table} ORDER BY queue"
+                )
+                queue_names = [r["queue"] for r in qrows]
 
-        result: dict[str, Any] = {}
+        result: dict[str, Any] = {
+            q: {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+            for q in queue_names
+        }
         for r in rows:
             q = r["queue"]
             if q not in result:
                 result[q] = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
-            result[q][r["metric"]] = r["cnt"]
-
-        if queue and queue not in result:
-            pending = await self.size(queue)
-            result[queue] = {"pending": pending, "processing": 0, "completed": 0, "failed": 0}
+            if r["status"] in result[q]:
+                result[q][r["status"]] = int(r["cnt"])
         return result
 
     async def report_supervisor(self, stats: dict[str, Any]) -> None:
@@ -421,15 +475,19 @@ class PostgresDriver(BaseDriver):
             return
         now = _now_ts()
         payload = json.dumps(stats)
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"""INSERT INTO {self._supervisors_table} (name, data, heartbeat_at)
-                    VALUES ($1, $2::jsonb, $3)
-                    ON CONFLICT (name) DO UPDATE SET
-                        data=EXCLUDED.data,
-                        heartbeat_at=EXCLUDED.heartbeat_at""",
-                name, payload, now,
-            )
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"""INSERT INTO {self._supervisors_table} (name, data, heartbeat_at)
+                        VALUES ($1, $2::jsonb, $3)
+                        ON CONFLICT (name) DO UPDATE SET
+                            data=EXCLUDED.data,
+                            heartbeat_at=EXCLUDED.heartbeat_at""",
+                    name, payload, now,
+                )
+
+        await self._with_disk_full_recovery(_do)
 
     async def get_supervisor_stats(self, stale_after: float = 10.0) -> list[dict[str, Any]]:
         cutoff = _now_ts() - stale_after
@@ -454,11 +512,14 @@ class PostgresDriver(BaseDriver):
     # ── Batch helpers ───────────────────────────────────────────
 
     async def store_batch(self, batch_id: str, data: dict[str, Any]) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"INSERT INTO {self._batches_table} (id, data) VALUES ($1, $2)",
-                batch_id, json.dumps(data),
-            )
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"INSERT INTO {self._batches_table} (id, data) VALUES ($1, $2)",
+                    batch_id, json.dumps(data),
+                )
+
+        await self._with_disk_full_recovery(_do)
 
     async def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
@@ -468,29 +529,35 @@ class PostgresDriver(BaseDriver):
         return None
 
     async def update_batch(self, batch_id: str, data: dict[str, Any]) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE {self._batches_table} SET data=$1 WHERE id=$2",
-                json.dumps(data), batch_id,
-            )
+        async def _do():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE {self._batches_table} SET data=$1 WHERE id=$2",
+                    json.dumps(data), batch_id,
+                )
+
+        await self._with_disk_full_recovery(_do)
 
     async def increment_batch_counter(
         self, batch_id: str, field: str, delta: int = 1,
     ) -> dict[str, Any] | None:
         # jsonb_set with COALESCE so missing fields start at 0. Returns the
         # post-update row in a single statement -> atomic.
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""UPDATE {self._batches_table}
-                    SET data = jsonb_set(
-                        data,
-                        ARRAY[$1],
-                        to_jsonb(COALESCE((data->>$1)::int, 0) + $2)
-                    )
-                    WHERE id = $3
-                    RETURNING data""",
-                field, delta, batch_id,
-            )
+        async def _do():
+            async with self._pool.acquire() as conn:
+                return await conn.fetchrow(
+                    f"""UPDATE {self._batches_table}
+                        SET data = jsonb_set(
+                            data,
+                            ARRAY[$1],
+                            to_jsonb(COALESCE((data->>$1)::int, 0) + $2)
+                        )
+                        WHERE id = $3
+                        RETURNING data""",
+                    field, delta, batch_id,
+                )
+
+        row = await self._with_disk_full_recovery(_do)
         if row is None:
             return None
         raw = row["data"]
@@ -531,25 +598,36 @@ class PostgresDriver(BaseDriver):
             return 0
 
         where = " AND ".join(conditions)
-        async with self._pool.acquire() as conn:
-            result = await conn.execute(f"DELETE FROM {self._jobs_table} WHERE {where}", *params)
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                return await conn.execute(f"DELETE FROM {self._jobs_table} WHERE {where}", *params)
+
+        result = await self._with_disk_full_recovery(_do)
         return int(result.split()[-1])
 
     async def flush(self, queue: str | None = None) -> None:
-        async with self._pool.acquire() as conn:
-            if queue:
-                await conn.execute(f"DELETE FROM {self._jobs_table} WHERE queue=$1", queue)
-            else:
-                await conn.execute(
-                    f"TRUNCATE {self._jobs_table}, {self._batches_table}, {self._metrics_table}, {self._supervisors_table}"
-                )
+        async def _do():
+            async with self._pool.acquire() as conn:
+                if queue:
+                    await conn.execute(f"DELETE FROM {self._jobs_table} WHERE queue=$1", queue)
+                else:
+                    await conn.execute(
+                        f"TRUNCATE {self._jobs_table}, {self._batches_table}, {self._metrics_table}, {self._supervisors_table}"
+                    )
+
+        await self._with_disk_full_recovery(_do)
 
     async def prune_metrics(self, older_than_seconds: float) -> int:
         cutoff = _now_ts() - older_than_seconds
-        async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                f"DELETE FROM {self._metrics_table} WHERE recorded_at < $1", cutoff,
-            )
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                return await conn.execute(
+                    f"DELETE FROM {self._metrics_table} WHERE recorded_at < $1", cutoff,
+                )
+
+        result = await self._with_disk_full_recovery(_do)
         return int(result.split()[-1])
 
     async def recent_throughput(

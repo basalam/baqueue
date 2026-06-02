@@ -55,8 +55,8 @@ class BaQueueConfig(BaseModel):
 
     # ── Auto-prune (primary, seconds-based) ─────────────────────
     auto_prune: bool = True
-    prune_interval_seconds: int = 60
-    prune_completed_seconds: int = 1800  # 30 minutes
+    prune_interval_seconds: int = 5
+    prune_completed_seconds: int = 5  # delete completed jobs ~5s after completion
     prune_other_seconds: int = 86400  # 1 day — applies to failed + cancelled
     prune_metrics_seconds: int = 604800  # 7 days
 
@@ -67,6 +67,12 @@ class BaQueueConfig(BaseModel):
     prune_failed_hours: float = 0
     prune_cancelled_hours: float = 0
     prune_metrics_hours: float = 0
+
+    # ── Disk-full auto-cleanup ─────────────────────────────────
+    # When a driver write hits "disk full" / "out of memory" / "out of space",
+    # the driver runs an emergency cleanup (purges all completed/failed/cancelled
+    # jobs + old metrics) and retries the operation once before re-raising.
+    auto_cleanup_on_disk_full: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BaQueueConfig:
