@@ -179,21 +179,25 @@ class TestPrune:
 class TestRetryFailed:
     """The new bulk-retry method introduced for the dashboard / CLI."""
 
-    async def _fail_all(self, configured_queue, jobs_to_fail: int = 5, queue: str = "default", tag: str | None = None):
+    async def _fail_all(
+        self,
+        configured_queue,
+        jobs_to_fail: int = 5,
+        queue: str = "default",
+        tag: str | None = None,
+        created_at: float | None = None,
+    ):
         driver = configured_queue.get_driver()
         ids = []
         for i in range(jobs_to_fail):
+            # Push, then mutate the stored payload directly before failing it.
+            jid = await configured_queue.push(SimpleJob, x=i)
+            stored = await driver.get_job(jid)
+            stored.queue = queue
             if tag:
-                # Push with custom tag by setting class attribute path; easier to push
-                # then mutate the stored payload directly.
-                jid = await configured_queue.push(SimpleJob, x=i)
-                stored = await driver.get_job(jid)
                 stored.tags.append(tag)
-                stored.queue = queue
-            else:
-                jid = await configured_queue.push(SimpleJob, x=i)
-                stored = await driver.get_job(jid)
-                stored.queue = queue
+            if created_at is not None:
+                stored.created_at = created_at
             await driver.fail(stored, f"boom {i}")
             ids.append(jid)
         return ids
@@ -239,14 +243,13 @@ class TestRetryFailed:
         assert all("low" in j.tags for j in remaining)
 
     async def test_created_from_filter(self, configured_queue):
-        # Push 3 jobs, fail them, then push 2 more later and fail them.
-        await self._fail_all(configured_queue, jobs_to_fail=3)
-        cutoff = _now_ts()
-        # ensure later jobs have created_at strictly greater than cutoff
-        import asyncio
-        await asyncio.sleep(0.01)
-        await self._fail_all(configured_queue, jobs_to_fail=2)
+        # Use explicit created_at values instead of sleeping: datetime.now()
+        # ticks at ~15ms on Windows / Python <=3.12, coarser than any short
+        # sleep, so a wall-clock cutoff between two quick batches is unreliable.
+        await self._fail_all(configured_queue, jobs_to_fail=3, created_at=1_000.0)
+        await self._fail_all(configured_queue, jobs_to_fail=2, created_at=2_000.0)
 
+        cutoff = 1_500.0
         n = await configured_queue.retry_failed(created_from=cutoff)
         assert n == 2  # Only the newer 2 should retry
 
