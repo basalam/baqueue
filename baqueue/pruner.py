@@ -57,26 +57,35 @@ class Pruner:
             return self.config.prune_metrics_hours * 3600
         return float(self.config.prune_metrics_seconds)
 
+    async def _prune_terminal(self, status: str, older_than: float) -> int:
+        """Prune a terminal status via the driver's index-consistent bulk delete.
+
+        The driver drains the whole backlog in capped batches (so a large or
+        orphan-laden index never blocks the backend) and reaps orphaned index entries
+        in the same pass, returning the total removed."""
+        return await self.driver.prune_terminal_jobs(
+            status=status,
+            older_than=older_than,
+            limit=max(1, int(self.config.prune_batch_size)),
+        )
+
     async def prune_once(self) -> dict[str, int]:
         """Run a single prune pass based on config."""
         results: dict[str, int] = {}
 
         if self.completed_threshold > 0:
-            results["completed"] = await self.driver.prune(
-                status="completed",
-                older_than_seconds=self.completed_threshold,
+            results["completed"] = await self._prune_terminal(
+                "completed", self.completed_threshold,
             )
 
         if self.failed_threshold > 0:
-            results["failed"] = await self.driver.prune(
-                status="failed",
-                older_than_seconds=self.failed_threshold,
+            results["failed"] = await self._prune_terminal(
+                "failed", self.failed_threshold,
             )
 
         if self.cancelled_threshold > 0:
-            results["cancelled"] = await self.driver.prune(
-                status="cancelled",
-                older_than_seconds=self.cancelled_threshold,
+            results["cancelled"] = await self._prune_terminal(
+                "cancelled", self.cancelled_threshold,
             )
 
         if self.metrics_threshold > 0:

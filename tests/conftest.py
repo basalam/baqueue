@@ -55,6 +55,27 @@ async def sqlite_driver(tmp_path) -> AsyncIterator[SqliteDriver]:
         await driver.disconnect()
 
 
+# ── Redis driver (fakeredis-backed; no external server needed) ───────────
+
+@pytest_asyncio.fixture
+async def redis_driver() -> AsyncIterator:
+    """RedisDriver wired to an in-process fakeredis instance.
+
+    Bypasses connect()/from_url() so no real Redis (or network) is required, while
+    still exercising the real ZSET secondary-index code paths."""
+    fakeredis = pytest.importorskip("fakeredis")
+    from baqueue.drivers.redis_driver import RedisDriver
+
+    driver = RedisDriver(url="redis://fake/0")
+    driver._redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    await driver._backfill_indexes_if_needed()
+    try:
+        yield driver
+    finally:
+        await driver._redis.flushall()
+        await driver._redis.aclose()
+
+
 # ── Parameterized driver fixture (memory + sqlite) ───────────────────────
 
 @pytest_asyncio.fixture(params=["memory", "sqlite"])

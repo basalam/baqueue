@@ -223,6 +223,21 @@ await Queue.prune(status="completed", hours=24)
 await Queue.prune(tag="batch:newsletter")
 ```
 
+#### Redis index health
+
+The Redis driver keeps secondary indexes (sorted sets) so the dashboard can list and
+count jobs by queue/status efficiently. All deletes go through an index-consistent path
+that removes the job hash *and* every index entry in one atomic step, so the indexes stay
+bounded. If entries are ever orphaned out-of-band (e.g. job hashes deleted directly via
+`redis-cli`), pruning reaps them automatically, and you can force a full repair:
+
+```bash
+baqueue reconcile-indexes -d redis --driver-url redis://localhost:6379/0
+```
+
+Set `reconcile_on_connect=True` to run that repair once on every startup (off by default
+to keep connect fast on large datasets).
+
 ### Retry Failed Jobs
 
 Bulk-retry failed jobs from the CLI, from Python, or from the dashboard.
@@ -457,6 +472,7 @@ baqueue schedule      Start the job scheduler
 baqueue dashboard     Launch the monitoring dashboard
 baqueue prune         Prune old jobs
 baqueue retry-failed  Retry all failed jobs (filter by queue/tag/age)
+baqueue reconcile-indexes  Repair Redis secondary indexes (drop stale entries)
 baqueue status        Show queue status
 baqueue test          Run the test suite
 ```

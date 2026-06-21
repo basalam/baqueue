@@ -365,6 +365,37 @@ async def _run_retry_failed(
         await Queue.disconnect()
 
 
+@cli.command(name="reconcile-indexes")
+@click.option("--batch", default=500, type=int, help="Index entries scanned per batch.")
+@click.option("--driver", "-d", default="redis", help="Driver name (sqlite, memory, redis, postgres).")
+@click.option("--driver-url", default=None, help="Driver connection URL.")
+@click.pass_context
+def reconcile_indexes(
+    ctx: click.Context,
+    batch: int,
+    driver: str,
+    driver_url: str | None,
+) -> None:
+    """Repair secondary indexes: remove entries pointing at jobs that no longer exist.
+
+    Only the Redis driver maintains secondary indexes; this is a no-op elsewhere."""
+    _validate_driver(driver)
+    config: BaQueueConfig = ctx.obj["config"]
+    config.driver = DriverConfig(name=driver, url=driver_url or "")
+
+    removed = _run_async(_run_reconcile_indexes, config, batch)
+    click.echo(f"Removed {removed or 0} stale index entr{'y' if removed == 1 else 'ies'}.")
+
+
+async def _run_reconcile_indexes(config: BaQueueConfig, batch: int) -> int:
+    Queue.configure(config)
+    await Queue.connect()
+    try:
+        return await Queue.get_driver().reconcile_indexes(batch=batch)
+    finally:
+        await Queue.disconnect()
+
+
 @cli.command()
 @click.option("--driver", "-d", default="sqlite", help="Driver name (sqlite, memory, redis, postgres).")
 @click.option("--driver-url", default=None, help="Driver connection URL.")

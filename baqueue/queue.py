@@ -30,6 +30,7 @@ class Queue:
         cls._config = config or BaQueueConfig()
         if driver is not None:
             driver.auto_cleanup_on_disk_full = cls._config.auto_cleanup_on_disk_full
+            driver.reconcile_on_connect = cls._config.reconcile_on_connect
         cls._driver = driver
         cls._events = EventBus.default()
 
@@ -222,4 +223,5 @@ def _create_driver(config: BaQueueConfig) -> BaseDriver:
     else:
         raise ValueError(f"Unknown driver: {name}")
     driver.auto_cleanup_on_disk_full = config.auto_cleanup_on_disk_full
+    driver.reconcile_on_connect = config.reconcile_on_connect
     return driver

@@ -10,6 +10,10 @@ from baqueue.serializer import JobPayload
 
 logger = logging.getLogger("baqueue.driver")
 
+# Default per-call cap for batched bulk-delete / prune operations. Keeps a single
+# call from blocking the backend on very large datasets; callers loop to drain.
+DEFAULT_PRUNE_BATCH = 1000
+
 
 class BaseDriver(ABC):
     """Every BaQueue driver must implement this interface."""
@@ -17,6 +21,11 @@ class BaseDriver(ABC):
     # When True, write operations that fail with a storage-full error trigger
     # an emergency cleanup and one retry. Wired from BaQueueConfig in queue.py.
     auto_cleanup_on_disk_full: bool = True
+
+    # When True, connect() runs a one-shot reconcile_indexes() pass to heal any
+    # secondary-index drift accumulated while offline. Off by default so connect
+    # stays fast on large datasets. Wired from BaQueueConfig in queue.py.
+    reconcile_on_connect: bool = False
 
     # Re-entrancy guard so emergency_cleanup() doesn't recurse if its own
     # prune calls also hit disk-full.
@@ -192,6 +201,41 @@ class BaseDriver(ABC):
     ) -> int:
         """Delete matching jobs. Returns count of pruned jobs."""
         ...
+
+    async def bulk_delete_jobs(self, job_ids: list[str], *, limit: int | None = None) -> int:
+        """Delete an explicit list of jobs, keeping any secondary indexes consistent.
+
+        Default implementation deletes one id at a time via ``delete``; drivers with
+        secondary indexes (Redis) override this with an atomic, batched version that
+        also reaps orphaned index entries. Returns the count of ids processed."""
+        if limit is not None:
+            job_ids = job_ids[:limit]
+        for job_id in job_ids:
+            await self.delete(job_id)
+        return len(job_ids)
+
+    async def prune_terminal_jobs(
+        self,
+        queue: str | None = None,
+        status: str | None = None,
+        *,
+        older_than: float | None = None,
+        limit: int = DEFAULT_PRUNE_BATCH,
+    ) -> int:
+        """Index-consistent bulk delete of terminal jobs, capped at ``limit`` per call.
+
+        Default implementation delegates to ``prune``; the Redis driver overrides it to
+        use its status index as the work source, reap orphaned index entries, and bound
+        the per-call cost. Callers loop until a pass returns fewer than ``limit``."""
+        return await self.prune(status=status, queue=queue, older_than_seconds=older_than)
+
+    async def reconcile_indexes(self, batch: int = 500) -> int:
+        """Repair secondary indexes by removing entries whose job no longer exists.
+
+        No-op for drivers without secondary indexes (memory/sqlite/postgres). The Redis
+        driver overrides this to walk its index ZSETs and ZREM orphaned ids. Returns the
+        number of stale index entries removed."""
+        return 0
 
     @abstractmethod
     async def flush(self, queue: str | None = None) -> None:

@@ -6,10 +6,15 @@ import json
 import logging
 from typing import Any
 
-from baqueue.drivers.base import BaseDriver
+from baqueue.drivers.base import DEFAULT_PRUNE_BATCH, BaseDriver
 from baqueue.serializer import JobPayload, _now_ts
 
 logger = logging.getLogger("baqueue.redis")
+
+# Every status a job hash can carry. Used when reaping orphaned index entries:
+# the job hash is gone, so we can't read its status — we ZREM from every global
+# status index to be sure the stale id is cleared.
+_ALL_STATUSES = ("pending", "processing", "completed", "failed", "cancelled")
 
 
 class RedisDriver(BaseDriver):
@@ -88,6 +93,10 @@ class RedisDriver(BaseDriver):
         self._redis = aioredis.from_url(self._url, decode_responses=True, **self._kwargs)
         await self._redis.ping()
         await self._backfill_indexes_if_needed()
+        if self.reconcile_on_connect:
+            removed = await self.reconcile_indexes()
+            if removed:
+                logger.info("reconcile_on_connect removed %d stale index entr(ies)", removed)
 
     async def disconnect(self) -> None:
         if self._redis:
@@ -97,7 +106,11 @@ class RedisDriver(BaseDriver):
     async def _backfill_indexes_if_needed(self) -> None:
         """One-time rebuild of secondary ZSETs for upgrades from a version
         that didn't maintain them. Safe to call on every connect — exits fast
-        when the global index is non-empty."""
+        when the global index is non-empty.
+
+        This is *add-only*: it inserts index entries for existing job hashes. It
+        cannot remove drift (index entries whose hash is gone) — that is the job
+        of reconcile_indexes(). Together they fully heal the indexes."""
         if await self._redis.exists(self._idx_all()):
             return
         cursor: Any = "0"
@@ -518,6 +531,110 @@ class RedisDriver(BaseDriver):
 
     # ── Pruning ─────────────────────────────────────────────────
 
+    def _index_remove_orphan(self, pipe: Any, job_id: str, queue: str | None, status: str | None) -> None:
+        """ZREM a stale id whose job hash is gone. We can't read the job's real
+        queue/status, so we clear every index family we can infer from the call:
+        always jobs:all + every global status index, plus the queue-scoped families
+        when the caller knows the queue/status it was iterating."""
+        pipe.zrem(self._idx_all(), job_id)
+        for st in _ALL_STATUSES:
+            pipe.zrem(self._idx_status(st), job_id)
+        if queue:
+            pipe.zrem(self._idx_queue(queue), job_id)
+            for st in _ALL_STATUSES:
+                pipe.zrem(self._idx_queue_status(queue, st), job_id)
+
+    async def _prune_index_batch(
+        self,
+        index: str,
+        queue: str | None,
+        status: str | None,
+        tag: str | None,
+        older_than_seconds: float | None,
+        offset: int,
+        limit: int,
+    ) -> tuple[int, int, int]:
+        """Process one window ``[offset, offset+limit)`` of an index in a single
+        atomic pass.
+
+        Live jobs matching the filters are fully deleted (hash + all four index
+        families). Orphaned ids (hash already gone) are reaped from the indexes so
+        they can never accumulate. Non-matching live jobs are left in place. Returns
+        ``(removed, scanned, skipped)``: removed = deleted + reaped, scanned = window
+        size actually read, skipped = live jobs left in place (so the caller can step
+        its offset past them)."""
+        candidate_ids: list[str] = await self._redis.zrange(index, offset, offset + limit - 1)
+        if not candidate_ids:
+            return 0, 0, 0
+
+        pipe = self._redis.pipeline()
+        for jid in candidate_ids:
+            pipe.hget(self._key("job", jid), "data")
+        raws = await pipe.execute()
+
+        now = _now_ts()
+        to_delete: list[JobPayload] = []
+        orphans: list[str] = []
+        skipped = 0
+        for jid, raw in zip(candidate_ids, raws):
+            if not raw:
+                orphans.append(jid)
+                continue
+            job = JobPayload.from_json(raw)
+            if tag and tag not in job.tags:
+                skipped += 1
+                continue
+            if older_than_seconds and (now - job.updated_at) < older_than_seconds:
+                skipped += 1
+                continue
+            to_delete.append(job)
+
+        if to_delete or orphans:
+            async def _do():
+                pipe = self._redis.pipeline()
+                for job in to_delete:
+                    pipe.lrem(self._key("queue", job.queue), 0, job.id)
+                    pipe.zrem(self._key("delayed"), job.id)
+                    pipe.unlink(self._key("job", job.id))
+                    self._index_remove(pipe, job.id, job.queue, job.status)
+                for jid in orphans:
+                    self._index_remove_orphan(pipe, jid, queue, status)
+                await pipe.execute()
+            await self._with_disk_full_recovery(_do)
+
+        return len(to_delete) + len(orphans), len(candidate_ids), skipped
+
+    async def _drain_index(
+        self,
+        index: str,
+        queue: str | None,
+        status: str | None,
+        tag: str | None,
+        older_than_seconds: float | None,
+        batch: int,
+    ) -> int:
+        """Page through an index in ``batch``-sized windows, deleting matches and
+        reaping orphans, until the whole index has been scanned.
+
+        Each Redis round-trip handles at most ``batch`` ids, so a huge (possibly
+        orphan-laden) index never blocks the server on one giant zrange + delete —
+        while every entry is still examined. Entries a filter skips stay in the index,
+        so the offset is advanced past them; that is what keeps matches deeper than
+        the first window from being missed (re-reading ``zrange(0, batch)`` forever
+        would stop early)."""
+        batch = max(1, batch)
+        offset = 0
+        total = 0
+        while True:
+            removed, scanned, skipped = await self._prune_index_batch(
+                index, queue, status, tag, older_than_seconds, offset, batch,
+            )
+            total += removed
+            offset += skipped  # kept entries remain; step past them next round
+            if scanned < batch:
+                break
+        return total
+
     async def prune(
         self,
         status: str | None = None,
@@ -527,42 +644,100 @@ class RedisDriver(BaseDriver):
     ) -> int:
         if not (status or tag or older_than_seconds or queue):
             return 0
-
         index = self._index_key(queue, status)
-        candidate_ids: list[str] = await self._redis.zrange(index, 0, -1)
-        if not candidate_ids:
+        return await self._drain_index(
+            index, queue, status, tag, older_than_seconds, DEFAULT_PRUNE_BATCH,
+        )
+
+    async def prune_terminal_jobs(
+        self,
+        queue: str | None = None,
+        status: str | None = None,
+        *,
+        older_than: float | None = None,
+        limit: int = DEFAULT_PRUNE_BATCH,
+    ) -> int:
+        """Index-consistent bulk delete from a status index, draining fully in
+        ``limit``-sized batches (each Redis round-trip handles at most ``limit`` ids).
+
+        Uses the secondary index itself as the work source — no SCAN of every job
+        hash — and reaps orphaned index entries in the same pass."""
+        index = self._index_key(queue, status)
+        return await self._drain_index(index, queue, status, None, older_than, limit)
+
+    async def bulk_delete_jobs(self, job_ids: list[str], *, limit: int | None = None) -> int:
+        """Delete an explicit list of jobs atomically, keeping all four index
+        families consistent. Live jobs are removed precisely (real queue/status from
+        the hash); ids whose hash is already gone are reaped from jobs:all and every
+        global status index (per-queue orphans are caught by reconcile_indexes)."""
+        if limit is not None:
+            job_ids = job_ids[:limit]
+        if not job_ids:
             return 0
 
         pipe = self._redis.pipeline()
-        for jid in candidate_ids:
+        for jid in job_ids:
             pipe.hget(self._key("job", jid), "data")
         raws = await pipe.execute()
 
-        now = _now_ts()
-        to_delete: list[JobPayload] = []
-        for raw in raws:
-            if not raw:
-                continue
-            job = JobPayload.from_json(raw)
-            if tag and tag not in job.tags:
-                continue
-            if older_than_seconds and (now - job.updated_at) < older_than_seconds:
-                continue
-            to_delete.append(job)
-
-        if not to_delete:
-            return 0
-
         async def _do():
             pipe = self._redis.pipeline()
-            for job in to_delete:
-                pipe.lrem(self._key("queue", job.queue), 0, job.id)
-                pipe.zrem(self._key("delayed"), job.id)
-                pipe.delete(self._key("job", job.id))
-                self._index_remove(pipe, job.id, job.queue, job.status)
+            for jid, raw in zip(job_ids, raws):
+                if raw:
+                    job = JobPayload.from_json(raw)
+                    pipe.lrem(self._key("queue", job.queue), 0, jid)
+                    pipe.zrem(self._key("delayed"), jid)
+                    pipe.unlink(self._key("job", jid))
+                    self._index_remove(pipe, jid, job.queue, job.status)
+                else:
+                    self._index_remove_orphan(pipe, jid, None, None)
             await pipe.execute()
         await self._with_disk_full_recovery(_do)
-        return len(to_delete)
+        return len(job_ids)
+
+    async def reconcile_indexes(self, batch: int = 500) -> int:
+        """Walk every secondary-index ZSET and ZREM ids whose job hash is gone.
+
+        Self-healing repair for index drift (e.g. job hashes deleted out-of-band).
+        Index keys are discovered by SCAN (every ``baqueue:jobs:*`` key — jobs:all,
+        jobs:status:*, jobs:queue:* and jobs:queue:*:status:*) so the repair reaches
+        families for queues no longer in the queues set, and never wastes a round-trip
+        on an index combination that does not exist. Each index is then walked with
+        ZSCAN — never loading a huge set at once — checking hash existence in pipelined
+        batches. Returns the number of stale entries removed."""
+        # Job hashes are baqueue:job:* (singular); the index ZSETs are baqueue:jobs:*.
+        index_keys: list[str] = []
+        cursor: Any = "0"
+        pattern = self._key("jobs", "*")
+        while True:
+            cursor, keys = await self._redis.scan(cursor=cursor, match=pattern, count=batch)
+            index_keys.extend(keys)
+            if cursor == "0" or cursor == 0:
+                break
+
+        removed = 0
+        for index in index_keys:
+            zcursor: Any = 0
+            while True:
+                zcursor, members = await self._redis.zscan(index, cursor=zcursor, count=batch)
+                ids = [m[0] if isinstance(m, (tuple, list)) else m for m in members]
+                if ids:
+                    pipe = self._redis.pipeline()
+                    for jid in ids:
+                        pipe.exists(self._key("job", jid))
+                    exists_flags = await pipe.execute()
+                    stale = [jid for jid, ok in zip(ids, exists_flags) if not ok]
+                    if stale:
+                        async def _do(index=index, stale=stale):
+                            pipe = self._redis.pipeline()
+                            for jid in stale:
+                                pipe.zrem(index, jid)
+                            await pipe.execute()
+                        await self._with_disk_full_recovery(_do)
+                        removed += len(stale)
+                if zcursor == 0 or zcursor == "0":
+                    break
+        return removed
 
     async def prune_metrics(self, older_than_seconds: float) -> int:
         cutoff = _now_ts() - older_than_seconds
@@ -635,11 +810,11 @@ class RedisDriver(BaseDriver):
                     pipe.delete(self._key("job", jid))
                     pipe.zrem(self._idx_all(), jid)
                     pipe.zrem(self._key("delayed"), jid)
-                    for st in ("pending", "processing", "completed", "failed"):
+                    for st in _ALL_STATUSES:
                         pipe.zrem(self._idx_status(st), jid)
                 # Drop all per-queue and per-(queue,status) indexes
                 pipe.delete(self._idx_queue(queue))
-                for st in ("pending", "processing", "completed", "failed"):
+                for st in _ALL_STATUSES:
                     pipe.delete(self._idx_queue_status(queue, st))
                 pipe.srem(self._key("queues"), queue)
                 await pipe.execute()

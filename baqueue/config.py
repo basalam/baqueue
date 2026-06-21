@@ -59,6 +59,14 @@ class BaQueueConfig(BaseModel):
     prune_completed_seconds: int = 5  # delete completed jobs ~5s after completion
     prune_other_seconds: int = 86400  # 1 day — applies to failed + cancelled
     prune_metrics_seconds: int = 604800  # 7 days
+    # Per-call cap for index-consistent bulk deletes; the pruner loops to drain.
+    prune_batch_size: int = 1000
+
+    # ── Secondary-index reconciliation (Redis) ─────────────────
+    # When True, connect() runs a one-shot reconcile pass that removes index
+    # entries pointing at jobs that no longer exist. Off by default — run on
+    # demand via `baqueue reconcile-indexes` to keep startup fast.
+    reconcile_on_connect: bool = False
 
     # ── Legacy hour-based overrides (kept for back-compat) ──────
     # When > 0, these take precedence over the seconds fields above for the

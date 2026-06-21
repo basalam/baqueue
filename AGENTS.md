@@ -28,7 +28,7 @@ baqueue/
 ├── retry.py              # BackoffStrategy enum + compute_delay + should_retry
 ├── events.py             # EventBus singleton: on / off / emit / emit_nowait
 ├── serializer.py         # JobPayload (slotted), resolve_job_class, get_class_path, _now_ts
-├── cli.py                # Click commands: work, schedule, dashboard, prune, retry-failed, status, test
+├── cli.py                # Click commands: work, schedule, dashboard, prune, retry-failed, reconcile-indexes, status, test
 ├── drivers/
 │   ├── base.py           # BaseDriver ABC — implement these methods for any new driver
 │   ├── memory_driver.py  # In-process only; never share across processes

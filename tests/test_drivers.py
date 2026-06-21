@@ -194,6 +194,43 @@ class TestPruning:
         n = await driver.prune(queue="q1")
         assert n == 2
 
+    async def test_bulk_delete_jobs(self, driver):
+        a = _make_payload(queue="default")
+        b = _make_payload(queue="default")
+        c = _make_payload(queue="default")
+        for p in (a, b, c):
+            await driver.push(p)
+        removed = await driver.bulk_delete_jobs([a.id, b.id])
+        assert removed == 2
+        assert await driver.get_job(a.id) is None
+        assert await driver.get_job(b.id) is None
+        assert await driver.get_job(c.id) is not None
+
+    async def test_bulk_delete_jobs_limit(self, driver):
+        ids = []
+        for _ in range(3):
+            p = _make_payload(queue="default")
+            await driver.push(p)
+            ids.append(p.id)
+        removed = await driver.bulk_delete_jobs(ids, limit=1)
+        assert removed == 1
+
+    async def test_prune_terminal_jobs(self, driver):
+        a = _make_payload(queue="default")
+        b = _make_payload(queue="default")
+        await driver.push(a)
+        await driver.push(b)
+        await driver.complete(a)
+        removed = await driver.prune_terminal_jobs(status="completed")
+        assert removed == 1
+        assert await driver.get_job(a.id) is None
+        assert await driver.get_job(b.id) is not None
+
+    async def test_reconcile_indexes_noop(self, driver):
+        # Drivers without secondary indexes report nothing to reconcile.
+        await driver.push(_make_payload(queue="default"))
+        assert await driver.reconcile_indexes() == 0
+
     async def test_flush_specific_queue(self, driver):
         await driver.push(_make_payload(queue="ephemeral"))
         await driver.push(_make_payload(queue="keep"))
