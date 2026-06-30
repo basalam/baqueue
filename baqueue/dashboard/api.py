@@ -117,7 +117,10 @@ class DashboardAPI:
             created_from=created_from, created_to=created_to,
         )
         return {
-            "jobs": [j.to_dict() for j in jobs],
+            # The list view never renders per-attempt history (the modal fetches
+            # job_detail for that), so omit it to keep the list and the live
+            # /ws/jobs push lean.
+            "jobs": [j.to_dict(include_history=False) for j in jobs],
             "page": page,
             "per_page": per_page,
             "count": len(jobs),
@@ -127,6 +130,10 @@ class DashboardAPI:
     async def job_detail(self, job_id: str) -> dict[str, Any] | None:
         job = await self.driver.get_job(job_id)
         return job.to_dict() if job else None
+
+    async def promote_job(self, job_id: str) -> bool:
+        """Make a scheduled/pending job runnable immediately. Returns True on success."""
+        return await self.driver.promote(job_id)
 
     async def retry_job(self, job_id: str) -> bool:
         job = await self.driver.get_job(job_id)

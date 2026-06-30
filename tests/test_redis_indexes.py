@@ -234,6 +234,74 @@ class TestReconcileIndexes:
         assert int(await d._redis.zcard(d._idx_all())) == 0
 
 
+class TestPromoteRedis:
+    async def test_promote_moves_scheduled_job_to_ready_list_once(self, redis_driver):
+        d = redis_driver
+        p = _payload(queue="q1", delay_until=_now_ts() + 3600)
+        await d.push(p)
+        # Sitting in the delayed ZSET, not yet in the ready list.
+        assert await d._redis.zscore(d._key("delayed"), p.id) is not None
+        assert await d._redis.lrange(d._key("queue", "q1"), 0, -1) == []
+
+        assert await d.promote(p.id) is True
+
+        # Removed from delayed, enqueued exactly once.
+        assert await d._redis.zscore(d._key("delayed"), p.id) is None
+        assert await d._redis.lrange(d._key("queue", "q1"), 0, -1) == [p.id]
+
+        popped = await d.pop("q1")
+        assert popped is not None and popped.id == p.id
+        assert popped.delay_until is None
+
+    async def test_promote_ready_job_does_not_duplicate(self, redis_driver):
+        d = redis_driver
+        p = _payload(queue="q1")  # no delay → already ready
+        await d.push(p)
+        assert await d.promote(p.id) is True
+        # Still a single copy in the ready list.
+        assert await d._redis.lrange(d._key("queue", "q1"), 0, -1) == [p.id]
+
+    async def test_promote_non_pending_returns_false(self, redis_driver):
+        d = redis_driver
+        ids = await _seed_terminal(d, "q1", 1, "completed")
+        assert await d.promote(ids[0]) is False
+
+    async def test_promote_missing_returns_false(self, redis_driver):
+        assert await redis_driver.promote("nope") is False
+
+
+class TestHistoryPersistenceRedis:
+    async def test_history_survives_retry_round_trip(self, redis_driver):
+        d = redis_driver
+        p = _payload(queue="q1")
+        await d.push(p)
+
+        # Attempt 1: the worker would append a record, then release for retry.
+        popped = await d.pop("q1")
+        popped.history.append({
+            "attempt": 1, "started_at": popped.started_at, "finished_at": _now_ts(),
+            "status": "failed", "error": "boom", "will_retry": True,
+            "next_retry_at": _now_ts() + 5,
+        })
+        await d.release(popped, delay=0)
+
+        reloaded = await d.get_job(p.id)
+        assert [h["status"] for h in reloaded.history] == ["failed"]
+
+        # Attempt 2: prior history is preserved, then a completion is appended.
+        popped2 = await d.pop("q1")
+        assert [h["status"] for h in popped2.history] == ["failed"]
+        popped2.history.append({
+            "attempt": 2, "started_at": popped2.started_at, "finished_at": _now_ts(),
+            "status": "completed", "error": None, "will_retry": False,
+            "next_retry_at": None,
+        })
+        await d.complete(popped2)
+
+        final = await d.get_job(p.id)
+        assert [h["status"] for h in final.history] == ["failed", "completed"]
+
+
 class TestPruneReapsOrphans:
     async def test_prune_no_longer_skips_orphans(self, redis_driver):
         """The legacy prune() bug: orphaned index entries were skipped forever.

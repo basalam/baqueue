@@ -1267,8 +1267,24 @@ body {
 .tl-dot.failed { border-color: var(--red); background: var(--red); }
 
 .tl-content { display: flex; flex-direction: column; gap: 1px; }
-.tl-label { font-size: 13px; font-weight: 600; }
+.tl-label { font-size: 13px; font-weight: 600; text-transform: capitalize; }
 .tl-time { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+.tl-dur { font-weight: 400; color: var(--text-muted); }
+.tl-retry { font-size: 12px; color: var(--amber); }
+.tl-error {
+    margin: 4px 0 0;
+    padding: 6px 8px;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--red);
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 140px;
+    overflow: auto;
+}
 
 /* ── Tags ───────────────────────────────────────────────── */
 

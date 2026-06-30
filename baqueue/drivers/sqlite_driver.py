@@ -377,6 +377,23 @@ class SqliteDriver(BaseDriver):
                 c.commit()
             await self._execute_with_retry(_do)
 
+    async def promote(self, job_id: str) -> bool:
+        now = _now_ts()
+        async with self._lock:
+            result = [False]
+            def _do():
+                c = self._get_conn()
+                # Clearing delay_until is enough: pop() already accepts a pending
+                # row whose delay_until IS NULL or has elapsed.
+                cur = c.execute(
+                    "UPDATE jobs SET delay_until=NULL, updated_at=? WHERE id=? AND status='pending'",
+                    (now, job_id),
+                )
+                c.commit()
+                result[0] = cur.rowcount == 1
+            await self._execute_with_retry(_do)
+            return result[0]
+
     # ── Query ───────────────────────────────────────────────────
 
     async def get_job(self, job_id: str) -> JobPayload | None:

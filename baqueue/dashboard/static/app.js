@@ -322,6 +322,14 @@ document.addEventListener("alpine:init", () => {
       this.fetchOverview();
     },
 
+    async executeJob(jobId) {
+      // Promote a scheduled/pending job so it runs immediately.
+      await fetch(`/api/jobs/${jobId}/execute`, { method: "POST" });
+      this.closeModal();
+      this.fetchJobs();
+      this.fetchOverview();
+    },
+
     async retryAllFailed() {
       const parts = [];
       if (this.jobsFilter.queue) parts.push(`queue "${this.jobsFilter.queue}"`);
@@ -431,6 +439,36 @@ document.addEventListener("alpine:init", () => {
       if (!job.started_at) return "-";
       const end = job.completed_at || job.failed_at || (Date.now() / 1000);
       const diff = end - job.started_at;
+      if (diff < 0.001) return "<1ms";
+      if (diff < 1) return Math.round(diff * 1000) + "ms";
+      if (diff < 60) return diff.toFixed(1) + "s";
+      return Math.floor(diff / 60) + "m " + Math.floor(diff % 60) + "s";
+    },
+
+    // ── Per-attempt timeline ────────────────────────────────
+
+    attemptHistory(job) {
+      return job && Array.isArray(job.history) ? job.history : [];
+    },
+
+    hasHistory(job) {
+      return this.attemptHistory(job).length > 0;
+    },
+
+    // A job currently processing has an in-flight attempt that isn't recorded in
+    // history yet (entries are appended only when an attempt concludes).
+    inFlightAttempt(job) {
+      return !!(job && job.status === "processing" && job.started_at);
+    },
+
+    attemptDotClass(entry) {
+      return entry && entry.status === "completed" ? "completed" : "failed";
+    },
+
+    attemptDuration(entry) {
+      if (!entry || !entry.started_at || !entry.finished_at) return "";
+      const diff = entry.finished_at - entry.started_at;
+      if (diff < 0) return "";
       if (diff < 0.001) return "<1ms";
       if (diff < 1) return Math.round(diff * 1000) + "ms";
       if (diff < 60) return diff.toFixed(1) + "s";

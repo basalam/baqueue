@@ -11,9 +11,15 @@ from baqueue.drivers.base import BaseDriver
 from baqueue.events import EventBus
 from baqueue.job import Job, FunctionJob
 from baqueue.retry import compute_delay, should_retry
-from baqueue.serializer import JobPayload, resolve_job_class
+from baqueue.serializer import JobPayload, resolve_job_class, _now_ts
 
 logger = logging.getLogger("baqueue.worker")
+
+# Per-attempt errors stored in JobPayload.history are truncated to this many
+# characters. The job's top-level `error` field keeps the full latest traceback;
+# this bound keeps the history (and therefore the stored payload) from growing
+# large across retries.
+_HISTORY_ERROR_MAXLEN = 1000
 
 
 class Worker:
@@ -84,6 +90,33 @@ class Worker:
                 return job
         return None
 
+    @staticmethod
+    def _record_attempt(
+        payload: JobPayload,
+        *,
+        status: str,
+        finished_at: float,
+        error: str | None = None,
+        will_retry: bool = False,
+        next_retry_at: float | None = None,
+    ) -> None:
+        """Append one bounded record describing the attempt that just concluded.
+
+        Called once per attempt, right before the driver persists the new state, so
+        drivers that store the whole payload (memory, redis) keep the full history.
+        The list is bounded by the number of attempts and the error is truncated."""
+        if error is not None and len(error) > _HISTORY_ERROR_MAXLEN:
+            error = error[:_HISTORY_ERROR_MAXLEN] + "…"
+        payload.history.append({
+            "attempt": payload.attempts,
+            "started_at": payload.started_at,
+            "finished_at": finished_at,
+            "status": status,
+            "error": error,
+            "will_retry": will_retry,
+            "next_retry_at": next_retry_at,
+        })
+
     async def _process(self, payload: JobPayload) -> None:
         self._current_job = payload
         job_timeout = payload.timeout or self.timeout
@@ -99,6 +132,7 @@ class Worker:
                 timeout=job_timeout,
             )
 
+            self._record_attempt(payload, status="completed", finished_at=_now_ts())
             await self.driver.complete(payload)
             await self.driver.record_metric(payload.queue, "completed", 1)
             await self.events.emit("job.completed", payload=payload, result=result, worker=self.name)
@@ -118,9 +152,16 @@ class Worker:
 
             if should_retry(payload.attempts, payload.max_attempts):
                 delay = compute_delay(payload.backoff, payload.attempts)
+                self._record_attempt(
+                    payload, status="failed", finished_at=_now_ts(),
+                    error=error_msg, will_retry=True, next_retry_at=_now_ts() + delay,
+                )
                 await self.driver.release(payload, delay=delay)
                 await self.events.emit("job.retrying", payload=payload, error=error_msg, delay=delay)
             else:
+                self._record_attempt(
+                    payload, status="failed", finished_at=_now_ts(), error=error_msg,
+                )
                 await self.driver.fail(payload, error_msg)
                 await self.driver.record_metric(payload.queue, "failed", 1)
                 await self.events.emit("job.failed", payload=payload, error=error_msg, worker=self.name)

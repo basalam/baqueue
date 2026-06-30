@@ -150,6 +150,11 @@ def create_app(driver: BaseDriver, config: Optional[BaQueueConfig] = None) -> An
         ok = await api.retry_job(job_id)
         return JSONResponse({"success": ok})
 
+    @app.post("/api/jobs/{job_id}/execute")
+    async def execute_job(job_id: str):
+        ok = await api.promote_job(job_id)
+        return JSONResponse({"success": ok})
+
     @app.delete("/api/jobs/{job_id}")
     async def delete_job(job_id: str):
         ok = await api.delete_job(job_id)

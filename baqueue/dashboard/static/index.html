@@ -511,27 +511,67 @@
                                     <span class="tl-time" x-text="formatTimeFull(selectedJob.delay_until)"></span>
                                 </div>
                             </div>
-                            <div class="tl-item" x-show="selectedJob.started_at">
-                                <div class="tl-dot processing"></div>
-                                <div class="tl-content">
-                                    <span class="tl-label">Started</span>
-                                    <span class="tl-time" x-text="formatTimeFull(selectedJob.started_at)"></span>
+                            <!-- Per-attempt history (jobs that ran at least once on a
+                                 driver that persists history). Each backoff retry is its
+                                 own entry. -->
+                            <template x-for="(entry, idx) in attemptHistory(selectedJob)" :key="idx">
+                                <div class="tl-item">
+                                    <div class="tl-dot" :class="attemptDotClass(entry)"></div>
+                                    <div class="tl-content">
+                                        <span class="tl-label">
+                                            Attempt <span x-text="entry.attempt"></span> &middot;
+                                            <span x-text="entry.status"></span>
+                                            <span class="tl-dur" x-show="attemptDuration(entry)" x-text="'(' + attemptDuration(entry) + ')'"></span>
+                                        </span>
+                                        <span class="tl-time" x-text="formatTimeFull(entry.started_at) + (entry.finished_at ? ' → ' + formatTimeFull(entry.finished_at) : '')"></span>
+                                        <span class="tl-retry" x-show="entry.will_retry">
+                                            Retry scheduled <span x-text="entry.next_retry_at ? scheduledIn(entry.next_retry_at) : ''"></span>
+                                        </span>
+                                        <pre class="tl-error" x-show="entry.error" x-text="entry.error"></pre>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="tl-item" x-show="selectedJob.completed_at">
-                                <div class="tl-dot completed"></div>
-                                <div class="tl-content">
-                                    <span class="tl-label">Completed</span>
-                                    <span class="tl-time" x-text="formatTimeFull(selectedJob.completed_at)"></span>
+                            </template>
+                            <!-- The currently-running attempt is not recorded in history
+                                 until it concludes, so surface it live. -->
+                            <template x-if="inFlightAttempt(selectedJob)">
+                                <div class="tl-item">
+                                    <div class="tl-dot processing"></div>
+                                    <div class="tl-content">
+                                        <span class="tl-label">Attempt <span x-text="selectedJob.attempts"></span> &middot; running&hellip;</span>
+                                        <span class="tl-time" x-text="formatTimeFull(selectedJob.started_at)"></span>
+                                    </div>
                                 </div>
-                            </div>
-                            <div class="tl-item" x-show="selectedJob.failed_at">
-                                <div class="tl-dot failed"></div>
-                                <div class="tl-content">
-                                    <span class="tl-label">Failed</span>
-                                    <span class="tl-time" x-text="formatTimeFull(selectedJob.failed_at)"></span>
+                            </template>
+
+                            <!-- Legacy single-attempt timeline: jobs created before history
+                                 tracking, or on drivers that don't persist history. -->
+                            <template x-if="!hasHistory(selectedJob) && !inFlightAttempt(selectedJob) && selectedJob.started_at">
+                                <div class="tl-item">
+                                    <div class="tl-dot processing"></div>
+                                    <div class="tl-content">
+                                        <span class="tl-label">Started</span>
+                                        <span class="tl-time" x-text="formatTimeFull(selectedJob.started_at)"></span>
+                                    </div>
                                 </div>
-                            </div>
+                            </template>
+                            <template x-if="!hasHistory(selectedJob) && selectedJob.completed_at">
+                                <div class="tl-item">
+                                    <div class="tl-dot completed"></div>
+                                    <div class="tl-content">
+                                        <span class="tl-label">Completed</span>
+                                        <span class="tl-time" x-text="formatTimeFull(selectedJob.completed_at)"></span>
+                                    </div>
+                                </div>
+                            </template>
+                            <template x-if="!hasHistory(selectedJob) && selectedJob.failed_at">
+                                <div class="tl-item">
+                                    <div class="tl-dot failed"></div>
+                                    <div class="tl-content">
+                                        <span class="tl-label">Failed</span>
+                                        <span class="tl-time" x-text="formatTimeFull(selectedJob.failed_at)"></span>
+                                    </div>
+                                </div>
+                            </template>
                         </div>
                     </div>
 
@@ -563,6 +603,10 @@
                 </div>
 
                 <div class="modal-actions">
+                    <button class="btn-primary" x-show="isScheduled(selectedJob)" @click="executeJob(selectedJob.id)">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        Execute Now
+                    </button>
                     <button class="btn-primary" x-show="selectedJob.status === 'failed'" @click="retryJob(selectedJob.id)">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
                         Retry Job

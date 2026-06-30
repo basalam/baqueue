@@ -171,6 +171,41 @@ class TestBulkRetryFailed:
         await Queue.disconnect()
 
 
+class TestPromoteAndHistory:
+    async def test_promote_scheduled_job(self):
+        await Queue.connect()
+        api = DashboardAPI(Queue.get_driver())
+        driver = Queue.get_driver()
+        # Schedule a job far in the future, then promote it via the API.
+        job_id = await Queue.later(SimpleJob, delay=3600)
+        assert await driver.pop("dapi_test") is None  # not yet available
+
+        ok = await api.promote_job(job_id)
+        assert ok is True
+        popped = await driver.pop("dapi_test")
+        assert popped is not None and popped.id == job_id
+        await Queue.disconnect()
+
+    async def test_promote_nonexistent_returns_false(self):
+        await Queue.connect()
+        api = DashboardAPI(Queue.get_driver())
+        assert await api.promote_job("nonexistent") is False
+        await Queue.disconnect()
+
+    async def test_job_detail_includes_history_but_list_omits_it(self):
+        await Queue.connect()
+        api = DashboardAPI(Queue.get_driver())
+        job_id = await Queue.push(SimpleJob)
+
+        detail = await api.job_detail(job_id)
+        assert "history" in detail
+
+        listing = await api.jobs_list(page=1, per_page=10)
+        assert listing["jobs"]
+        assert all("history" not in j for j in listing["jobs"])
+        await Queue.disconnect()
+
+
 class TestPrune:
     async def test_prune_via_api(self):
         await Queue.connect()

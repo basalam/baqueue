@@ -35,6 +35,7 @@ class JobPayload:
         "failed_at",
         "status",
         "error",
+        "history",
     )
 
     def __init__(
@@ -58,6 +59,7 @@ class JobPayload:
         failed_at: float | None = None,
         status: str = "pending",
         error: str | None = None,
+        history: list[dict[str, Any]] | None = None,
     ):
         self.id = id or uuid4().hex
         self.job_class = job_class
@@ -77,9 +79,14 @@ class JobPayload:
         self.failed_at = failed_at
         self.status = status
         self.error = error
+        # Per-attempt execution history (one record per processing attempt).
+        # Bounded by the number of attempts; persisted only by drivers that store
+        # the full payload (memory, redis). Older payloads without this key load
+        # as an empty list, so the field is fully backward compatible.
+        self.history = history or []
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_history: bool = True) -> dict[str, Any]:
+        d = {
             "id": self.id,
             "job_class": self.job_class,
             "data": self.data,
@@ -99,6 +106,9 @@ class JobPayload:
             "status": self.status,
             "error": self.error,
         }
+        if include_history:
+            d["history"] = self.history
+        return d
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())

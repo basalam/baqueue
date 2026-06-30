@@ -310,6 +310,32 @@ class RedisDriver(BaseDriver):
             await pipe.execute()
         await self._with_disk_full_recovery(_do)
 
+    async def promote(self, job_id: str) -> bool:
+        raw = await self._redis.hget(self._key("job", job_id), "data")
+        if not raw:
+            return False
+        payload = JobPayload.from_json(raw)
+        if payload.status != "pending":
+            return False
+        now = _now_ts()
+        # Only a job actually sitting in the delayed ZSET needs to be moved into
+        # its ready list. A pending job that is already ready (delay_until None or
+        # in the past) must NOT be re-pushed, or Redis pop — which does not
+        # re-check status — would process it twice.
+        was_scheduled = payload.delay_until is not None and payload.delay_until > now
+        payload.delay_until = None
+        payload.updated_at = now
+
+        async def _do():
+            pipe = self._redis.pipeline()
+            pipe.hset(self._key("job", job_id), mapping={"data": payload.to_json()})
+            if was_scheduled:
+                pipe.zrem(self._key("delayed"), job_id)
+                pipe.rpush(self._key("queue", payload.queue), job_id)
+            await pipe.execute()
+        await self._with_disk_full_recovery(_do)
+        return True
+
     # ── Query ───────────────────────────────────────────────────
 
     async def get_job(self, job_id: str) -> JobPayload | None:

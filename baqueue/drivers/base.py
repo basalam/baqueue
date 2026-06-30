@@ -115,6 +115,20 @@ class BaseDriver(ABC):
     @abstractmethod
     async def delete(self, job_id: str) -> None: ...
 
+    async def promote(self, job_id: str) -> bool:
+        """Make a scheduled/pending job runnable immediately (clear its delay).
+
+        Returns True if the job was promoted, False if it does not exist or is not
+        in the ``pending`` state. Concrete (non-abstract) so existing third-party
+        drivers keep working; the built-in drivers override it with a race-safe,
+        index-aware version. The default relies on ``release(delay=0)`` to enqueue
+        the job for immediate processing."""
+        job = await self.get_job(job_id)
+        if job is None or job.status != "pending":
+            return False
+        await self.release(job, delay=0)
+        return True
+
     # ── Query ───────────────────────────────────────────────────
 
     @abstractmethod

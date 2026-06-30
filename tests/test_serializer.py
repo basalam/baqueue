@@ -102,6 +102,37 @@ class TestJobPayload:
         assert len(ids) == 100, "JobPayload IDs must be unique"
 
 
+class TestJobPayloadHistory:
+    def test_history_defaults_to_empty_list(self):
+        p = JobPayload()
+        assert p.history == []
+        # distinct instances must not share the same list object
+        assert JobPayload().history is not p.history
+
+    def test_history_roundtrips_through_dict_and_json(self):
+        entry = {
+            "attempt": 1, "started_at": 1.0, "finished_at": 2.0,
+            "status": "failed", "error": "boom", "will_retry": True,
+            "next_retry_at": 7.0,
+        }
+        p = JobPayload(job_class="x.Y", history=[entry])
+        assert p.to_dict()["history"] == [entry]
+        restored = JobPayload.from_json(p.to_json())
+        assert restored.history == [entry]
+
+    def test_from_dict_without_history_is_backward_compatible(self):
+        # A payload serialized by an older version has no "history" key.
+        legacy = JobPayload(job_class="x.Y").to_dict()
+        legacy.pop("history")
+        restored = JobPayload.from_dict(legacy)
+        assert restored.history == []
+
+    def test_to_dict_can_exclude_history(self):
+        p = JobPayload(job_class="x.Y", history=[{"attempt": 1}])
+        assert "history" not in p.to_dict(include_history=False)
+        assert "history" in p.to_dict()
+
+
 class TestClassPath:
     def test_get_class_path(self):
         path = get_class_path(JobPayload)

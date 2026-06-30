@@ -116,6 +116,21 @@ class MemoryDriver(BaseDriver):
             if job_id in self._delayed:
                 self._delayed.remove(job_id)
 
+    async def promote(self, job_id: str) -> bool:
+        async with self._lock:
+            payload = self._jobs.get(job_id)
+            if payload is None or payload.status != "pending":
+                return False
+            payload.delay_until = None
+            payload.updated_at = _now_ts()
+            if job_id in self._delayed:
+                self._delayed.remove(job_id)
+            # Only enqueue if it isn't already ready, so promoting a non-delayed
+            # pending job can never duplicate it in the ready list.
+            if job_id not in self._queues[payload.queue]:
+                self._queues[payload.queue].append(job_id)
+            return True
+
     # ── Query ───────────────────────────────────────────────────
 
     async def get_job(self, job_id: str) -> JobPayload | None:

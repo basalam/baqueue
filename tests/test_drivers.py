@@ -103,6 +103,45 @@ class TestJobLifecycle:
         assert await driver.get_job(payload.id) is None
 
 
+class TestPromote:
+    async def test_promote_makes_scheduled_job_runnable_now(self, driver):
+        payload = _make_payload(queue="default", delay_until=_now_ts() + 3600)
+        await driver.push(payload)
+        # Scheduled far in the future: not yet available.
+        assert await driver.pop("default") is None
+
+        ok = await driver.promote(payload.id)
+        assert ok is True
+
+        # Now it can be dequeued immediately, and the delay is cleared.
+        popped = await driver.pop("default")
+        assert popped is not None
+        assert popped.id == payload.id
+        assert popped.delay_until is None
+
+    async def test_promote_missing_job_returns_false(self, driver):
+        assert await driver.promote("does-not-exist") is False
+
+    async def test_promote_non_pending_job_returns_false(self, driver):
+        payload = _make_payload(queue="default")
+        await driver.push(payload)
+        popped = await driver.pop("default")  # now processing
+        await driver.complete(popped)          # now completed
+        assert await driver.promote(payload.id) is False
+
+    async def test_promote_ready_job_does_not_duplicate(self, driver):
+        # A pending job that is already ready (no delay) promotes harmlessly and
+        # must not end up enqueued twice.
+        payload = _make_payload(queue="default")
+        await driver.push(payload)
+        assert await driver.promote(payload.id) is True
+
+        first = await driver.pop("default")
+        assert first is not None and first.id == payload.id
+        # No second copy lurking in the ready list.
+        assert await driver.pop("default") is None
+
+
 class TestQueries:
     async def test_get_jobs_filter_by_status(self, driver):
         a = _make_payload(queue="default")

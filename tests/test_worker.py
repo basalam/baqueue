@@ -73,6 +73,19 @@ class SlowJob(Job):
         await asyncio.sleep(5)  # exceeds timeout
 
 
+class FailsOnceThenSucceedsJob(Job):
+    queue = "wtest"
+    max_attempts = 3
+    backoff = [0, 0]  # retry immediately (no delay), so both attempts run in one pass
+
+    async def handle(self, **kw):
+        SIDE_EFFECTS["fail_count"] += 1
+        if SIDE_EFFECTS["fail_count"] == 1:
+            raise RuntimeError("E" * 5000)  # long error → must be truncated in history
+        SIDE_EFFECTS["ok"].append("done")
+        return "ok"
+
+
 @pytest.fixture(autouse=True)
 def _configure_queue():
     Queue.configure(BaQueueConfig(driver=DriverConfig(name="memory")))
@@ -178,6 +191,48 @@ class TestFailure:
         assert len(all_jobs) == 1
         # Could be pending (released) or in delayed pool
         # depending on timing of the fixed backoff (5s)
+        await Queue.disconnect()
+
+
+class TestAttemptHistory:
+    async def test_records_one_entry_per_attempt(self):
+        await Queue.connect()
+        job_id = await Queue.push(FailsOnceThenSucceedsJob)
+
+        worker = Worker(
+            driver=Queue.get_driver(), queues=["wtest"],
+            sleep_interval=0.05, name="w-history",
+        )
+        await _run_worker_once(worker, jobs_to_process=1)
+
+        job = await Queue.get_driver().get_job(job_id)
+        assert job is not None
+        # One record per attempt: a failed retry, then a completion.
+        assert [h["status"] for h in job.history] == ["failed", "completed"]
+        assert job.history[0]["will_retry"] is True
+        assert job.history[0]["next_retry_at"] is not None
+        assert job.history[1]["will_retry"] is False
+        assert job.history[1]["error"] is None
+        # History is bounded by the number of attempts.
+        assert len(job.history) == job.attempts == 2
+        await Queue.disconnect()
+
+    async def test_history_error_is_truncated(self):
+        await Queue.connect()
+        job_id = await Queue.push(FailsOnceThenSucceedsJob)
+
+        worker = Worker(
+            driver=Queue.get_driver(), queues=["wtest"],
+            sleep_interval=0.05, name="w-history-trunc",
+        )
+        await _run_worker_once(worker, jobs_to_process=1)
+
+        job = await Queue.get_driver().get_job(job_id)
+        err = job.history[0]["error"]
+        assert err is not None
+        # ~1000 chars + a single ellipsis marker; never the full 5000-char message.
+        assert len(err) <= 1001
+        assert err.endswith("…")
         await Queue.disconnect()
 
 

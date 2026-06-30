@@ -324,6 +324,24 @@ class PostgresDriver(BaseDriver):
 
         await self._with_disk_full_recovery(_do)
 
+    async def promote(self, job_id: str) -> bool:
+        now = _now_ts()
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                # Clearing delay_until is enough: pop() already accepts a pending
+                # row whose delay_until IS NULL or has elapsed.
+                return await conn.fetchrow(
+                    f"""UPDATE {self._jobs_table}
+                        SET delay_until=NULL, updated_at=$1
+                        WHERE id=$2 AND status='pending'
+                        RETURNING id""",
+                    now, job_id,
+                )
+
+        row = await self._with_disk_full_recovery(_do)
+        return row is not None
+
     # ── Query ───────────────────────────────────────────────────
 
     async def get_job(self, job_id: str) -> JobPayload | None:
