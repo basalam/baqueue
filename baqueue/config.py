@@ -28,6 +28,9 @@ class SupervisorConfig(BaseModel):
     sleep: float = 1.0  # seconds to sleep when queue is empty
     timeout: int = 60  # max job execution time in seconds
     memory_limit: int = 128  # MB
+    recover_stuck_jobs: bool = True
+    stuck_processing_seconds: int = 3600
+    stuck_check_interval_seconds: int = 60
 
 
 class ScheduleEntry(BaseModel):

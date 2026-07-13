@@ -31,6 +31,7 @@ class TestHelp:
         result = runner.invoke(cli, ["work", "--help"])
         assert result.exit_code == 0
         assert "--workers" in result.output
+        assert "--no-stuck-job-recovery" in result.output
 
     def test_prune_help(self):
         runner = CliRunner()

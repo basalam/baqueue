@@ -111,6 +111,31 @@ class TestProcessing:
         assert sorted(PROCESSED) == [0, 1, 2, 3, 4]
         await Queue.disconnect()
 
+    async def test_requeues_stuck_processing_jobs(self):
+        await Queue.connect()
+        await Queue.push(TrackedJob, n=42)
+        stuck = await Queue.get_driver().pop("sup_test")
+        assert stuck is not None
+        stuck.started_at = stuck.updated_at = stuck.started_at - 7200
+
+        sup = Supervisor(
+            driver=Queue.get_driver(),
+            config=SupervisorConfig(
+                queues=["sup_test"],
+                min_workers=1,
+                max_workers=1,
+                sleep=0.05,
+                stuck_processing_seconds=3600,
+                stuck_check_interval_seconds=1,
+            ),
+        )
+
+        await _run_supervisor_until(sup, lambda: 42 in PROCESSED, timeout=5.0)
+        assert 42 in PROCESSED
+        recovered = await Queue.get_job(stuck.id)
+        assert recovered.status == "completed"
+        await Queue.disconnect()
+
 
 class TestDelayedPromotion:
     async def test_delayed_job_promoted_and_processed(self):

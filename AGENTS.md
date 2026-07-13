@@ -21,7 +21,7 @@ baqueue/
 ├── queue.py              # Queue singleton facade: configure / connect / push / later / bulk / retry_failed / prune / metrics
 ├── batch.py              # Batch: fluent builder with .name/.then/.catch/.on_finally/.allow_failures/.tag/.dispatch
 ├── worker.py             # Worker loop: pop → handle → complete/fail/release with retry
-├── supervisor.py         # Worker pool, graceful shutdown, delayed-job poller, balancing loop
+├── supervisor.py         # Worker pool, graceful shutdown, delayed-job/stuck-job pollers, balancing loop
 ├── scheduler.py          # Cron + interval scheduler that pushes ScheduleEntry jobs
 ├── pruner.py             # Periodic pruning by status/age (uses prune_*_hours config)
 ├── balancer.py           # AutoBalancer / SimpleBalancer / NullBalancer + create_balancer()
@@ -51,7 +51,7 @@ tests/                    # pytest suite — run via `baqueue test` or `pytest t
 ├── test_queue.py         # Queue facade (push, later, bulk, prune, retry_failed)
 ├── test_drivers.py       # Cross-driver contract tests (memory + sqlite parameterized)
 ├── test_worker.py        # Worker lifecycle: success / failure / retry / timeout
-├── test_supervisor.py    # Supervisor pool + delayed-job promotion
+├── test_supervisor.py    # Supervisor pool + delayed-job promotion + stuck-job recovery
 ├── test_scheduler.py     # Scheduler interval dispatch
 ├── test_pruner.py        # Pruner by status / tag / age
 ├── test_batch.py         # Batch builder + lifecycle callbacks
@@ -109,6 +109,7 @@ These constraints exist for real reasons — preserve them when refactoring.
 10. **Event names are part of the public contract.** Documented in `EventBus`'s docstring: `job.pushed`, `job.started`, `job.completed`, `job.failed`, `job.retrying`, `batch.completed`, `batch.failed`, `worker.started`, `worker.stopped`, `supervisor.started`, `supervisor.stopped`, `queue.pruned`, `schedule.dispatched`, `batch.dispatched`. Don't rename them silently.
 11. **Job class resolution is by dotted path.** `serializer.resolve_job_class` does `importlib.import_module` + `getattr`. Jobs must therefore be importable by their qualified name from the worker process. Lambdas / nested classes won't work.
 12. **Decorator-defined jobs (`@Job.as_job`) become `FunctionJob` instances**, not classes. `Worker._instantiate` and `Queue._build_payload` both special-case this — keep both branches if you change the dispatch flow.
+13. **Stuck processing jobs are recovered by the supervisor.** `SupervisorConfig.recover_stuck_jobs=True` requeues jobs left in `processing` longer than `stuck_processing_seconds` (default 3600). Recovery is a driver contract (`requeue_stuck_jobs`) and must keep Redis secondary indexes/list membership consistent.
 
 ## Adding a New Driver
 
@@ -148,6 +149,7 @@ Extend `baqueue/cli.py`:
 - **Bulk retry lives on `Queue`, not on `DashboardAPI`.** The real implementation is `Queue.retry_failed(queue, tag, created_from, created_to)` in `queue.py`; `DashboardAPI.retry_failed_jobs` and the `baqueue retry-failed` CLI both delegate to it. The loop re-fetches `status="failed"` with `offset=0` after each batch — because `release()` flips status to `pending`, the failed-filtered list shrinks naturally. The iteration cap (`range(1000)`) is a safety net — don't remove it.
 - **Scheduled-job UI display rule.** A job is "scheduled" in the dashboard only when `status == "pending"` AND `delay_until * 1000 > Date.now()`. All drivers reset `delay_until` to `None` when the supervisor promotes a delayed job into the live queue, so the badge naturally disappears at execution time — don't add logic that infers "scheduled" from `delay_until` alone.
 - **Driver semantics differ for past-due delayed jobs.** `MemoryDriver.push` eagerly puts a job with `delay_until <= now` straight into the live queue; `SqliteDriver.push` keeps the row with `delay_until` set and relies on the next `pop_delayed()` to promote it. Both behaviours are correct — when writing driver-level tests, push with a tiny *future* delay + `asyncio.sleep` instead of a past timestamp.
+- **Stuck-job recovery uses `started_at` first, then `updated_at`.** Recovery changes stale `processing` jobs back to `pending`, clears `started_at`/`delay_until`, and preserves `attempts` so the original claim still counts. Long-running jobs should raise `stuck_processing_seconds` rather than disabling timeout semantics elsewhere.
 - **Tests reset singletons via an autouse fixture** in `tests/conftest.py`. `Queue` and `EventBus` are class-level singletons, so leaking config between tests will produce phantom failures. The `_reset_singletons` fixture is autouse — don't override or disable it without replacing it.
 - **`.baqueue.db`, `.baqueue.db-wal`, `.baqueue.db-shm`** are gitignored. Don't commit them — they appear whenever you run an example.
 - **`baqueue/screen/*.png`** are referenced from `README.md`. Don't move or rename them.

@@ -296,6 +296,88 @@ class RedisDriver(BaseDriver):
             await pipe.execute()
         await self._with_disk_full_recovery(_do)
 
+    async def _requeue_stuck_job(self, job_id: str, cutoff: float) -> int:
+        from redis.exceptions import WatchError
+
+        job_key = self._key("job", job_id)
+
+        async def _attempt() -> int:
+            pipe = self._redis.pipeline()
+            try:
+                await pipe.watch(job_key)
+                raw = await pipe.hget(job_key, "data")
+                if not raw:
+                    return 0
+
+                payload = JobPayload.from_json(raw)
+                if payload.status != "processing":
+                    return 0
+                started = payload.started_at or payload.updated_at
+                if started is None or started > cutoff:
+                    return 0
+
+                payload.status = "pending"
+                payload.started_at = None
+                payload.delay_until = None
+                payload.updated_at = _now_ts()
+
+                pipe.multi()
+                pipe.hset(job_key, mapping={"data": payload.to_json()})
+                pipe.zrem(self._key("delayed"), job_id)
+                pipe.lrem(self._key("queue", payload.queue), 0, job_id)
+                pipe.rpush(self._key("queue", payload.queue), job_id)
+                self._index_status_change(
+                    pipe,
+                    job_id,
+                    payload.queue,
+                    "processing",
+                    "pending",
+                    payload.created_at,
+                )
+                await pipe.execute()
+                return 1
+            finally:
+                await pipe.reset()
+
+        for _ in range(5):
+            try:
+                return int(await self._with_disk_full_recovery(_attempt) or 0)
+            except WatchError:
+                continue
+        return 0
+
+    async def requeue_stuck_jobs(
+        self,
+        older_than_seconds: float,
+        queue: str | None = None,
+    ) -> int:
+        cutoff = _now_ts() - older_than_seconds
+        index = self._index_key(queue, "processing")
+        ids = await self._redis.zrange(index, 0, -1)
+        if not ids:
+            return 0
+
+        pipe = self._redis.pipeline()
+        for jid in ids:
+            pipe.hget(self._key("job", jid), "data")
+        raws = await pipe.execute()
+
+        count = 0
+        for jid, raw in zip(ids, raws):
+            if not raw:
+                continue
+            try:
+                job = JobPayload.from_json(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if queue and job.queue != queue:
+                continue
+            started = job.started_at or job.updated_at
+            if started is None or started > cutoff:
+                continue
+            count += await self._requeue_stuck_job(jid, cutoff)
+        return count
+
     async def delete(self, job_id: str) -> None:
         raw = await self._redis.hget(self._key("job", job_id), "data")
 

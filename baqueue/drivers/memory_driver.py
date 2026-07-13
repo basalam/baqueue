@@ -107,6 +107,32 @@ class MemoryDriver(BaseDriver):
                 self._queues[payload.queue].append(payload.id)
             self._jobs[payload.id] = payload
 
+    async def requeue_stuck_jobs(
+        self,
+        older_than_seconds: float,
+        queue: str | None = None,
+    ) -> int:
+        cutoff = _now_ts() - older_than_seconds
+        now = _now_ts()
+        count = 0
+        async with self._lock:
+            for payload in self._jobs.values():
+                if queue and payload.queue != queue:
+                    continue
+                if payload.status != "processing":
+                    continue
+                started = payload.started_at or payload.updated_at
+                if started is None or started > cutoff:
+                    continue
+                payload.status = "pending"
+                payload.started_at = None
+                payload.delay_until = None
+                payload.updated_at = now
+                if payload.id not in self._queues[payload.queue]:
+                    self._queues[payload.queue].append(payload.id)
+                count += 1
+        return count
+
     async def delete(self, job_id: str) -> None:
         async with self._lock:
             self._jobs.pop(job_id, None)

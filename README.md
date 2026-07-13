@@ -23,6 +23,7 @@ A powerful Python queue management package. Multi-driver support, batch jobs, sc
   - [Dispatch Jobs](#dispatch-jobs)
   - [Batch Jobs](#batch-jobs)
   - [Run Workers](#run-workers)
+    - [Stuck Job Recovery](#stuck-job-recovery)
   - [Pruning](#pruning)
     - [Auto-pruning](#auto-pruning-runs-alongside-baqueue-work)
     - [Manual pruning](#manual-pruning)
@@ -43,6 +44,7 @@ A powerful Python queue management package. Multi-driver support, batch jobs, sc
 ## Features
 - **Multi-driver**: SQLite (default), Redis, PostgreSQL, or In-Memory
 - **Auto-balancing**: Dynamically scale workers based on queue pressure
+- **Stuck-job recovery**: Jobs left in `processing` for more than 1 hour are requeued automatically
 - **Auto-pruning**: Completed jobs are deleted about 5 seconds after they finish; failed/cancelled jobs are kept up to 1 day — all configurable
 - **Disk-full cleanup**: Storage-full/OOM driver errors trigger emergency cleanup of terminal jobs and old metrics, then retry once
 - **Pruning**: Remove old jobs by status, tag, or age
@@ -160,6 +162,41 @@ Or via CLI:
 ```bash
 baqueue work -q emails -q payments -w 3 -b auto
 ```
+
+#### Stuck Job Recovery
+
+When `baqueue work` is running, the supervisor also checks for jobs that were
+claimed by a worker but never finished. By default, any job that has stayed in
+`processing` for more than 1 hour is moved back to `pending`, so another worker
+can pick it up and run it again.
+
+This is intended for worker crashes, process restarts, or other cases where a
+job was left in-flight. The original claim still counts as an attempt; when the
+job is picked up again, its attempt counter continues from there.
+
+Configure it from Python:
+
+```python
+supervisor = Supervisor(
+    driver=Queue.get_driver(),
+    config=SupervisorConfig(
+        queues=["emails"],
+        recover_stuck_jobs=True,
+        stuck_processing_seconds=3600,
+        stuck_check_interval_seconds=60,
+    ),
+)
+```
+
+Or from the CLI:
+
+```bash
+baqueue work --stuck-job-timeout-seconds 7200
+baqueue work --no-stuck-job-recovery
+```
+
+If you intentionally run jobs for longer than 1 hour, increase
+`stuck_processing_seconds` above your longest expected runtime.
 
 ### Pruning
 
@@ -457,7 +494,7 @@ Coverage includes:
 - `Queue` facade — push / later / bulk / prune / `retry_failed`
 - Cross-driver contract tests (memory + sqlite, parameterized)
 - Worker lifecycle: success / failure / retry / timeout
-- Supervisor pool + delayed-job promotion
+- Supervisor pool + delayed-job promotion + stuck-job recovery
 - Scheduler interval dispatch
 - Pruner by status / tag / age
 - Batch builder + completion callbacks

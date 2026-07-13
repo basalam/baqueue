@@ -43,6 +43,7 @@ class Supervisor:
         self._heartbeat_task: asyncio.Task | None = None
         self._balance_task: asyncio.Task | None = None
         self._pruner_task: asyncio.Task | None = None
+        self._stuck_recovery_task: asyncio.Task | None = None
 
     @property
     def is_running(self) -> bool:
@@ -80,6 +81,8 @@ class Supervisor:
         await self._report_stats()
         self._delayed_task = asyncio.create_task(self._poll_delayed())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if self.config.recover_stuck_jobs and self.config.stuck_processing_seconds > 0:
+            self._stuck_recovery_task = asyncio.create_task(self._recover_stuck_loop())
 
         if self.balancer:
             self._balance_task = asyncio.create_task(self._balance_loop())
@@ -112,9 +115,17 @@ class Supervisor:
             self._balance_task.cancel()
         if self._pruner_task:
             self._pruner_task.cancel()
+        if self._stuck_recovery_task:
+            self._stuck_recovery_task.cancel()
 
         aux_tasks = [
-            t for t in (self._delayed_task, self._heartbeat_task, self._balance_task, self._pruner_task)
+            t for t in (
+                self._delayed_task,
+                self._heartbeat_task,
+                self._balance_task,
+                self._pruner_task,
+                self._stuck_recovery_task,
+            )
             if t is not None
         ]
         if aux_tasks:
@@ -123,6 +134,7 @@ class Supervisor:
         self._heartbeat_task = None
         self._balance_task = None
         self._pruner_task = None
+        self._stuck_recovery_task = None
 
         for task in self._tasks:
             task.cancel()
@@ -186,6 +198,30 @@ class Supervisor:
             except Exception:
                 logger.exception("Error in balance loop")
             await asyncio.sleep(5)
+
+    async def _recover_stuck_loop(self) -> None:
+        """Periodically requeue jobs left in processing after a worker crash."""
+        interval = max(1.0, float(self.config.stuck_check_interval_seconds))
+        while self._running:
+            try:
+                await self._recover_stuck_once()
+            except Exception:
+                logger.exception("Error recovering stuck processing jobs")
+            await asyncio.sleep(interval)
+
+    async def _recover_stuck_once(self) -> int:
+        timeout = float(self.config.stuck_processing_seconds)
+        if timeout <= 0:
+            return 0
+        total = 0
+        for queue in dict.fromkeys(self.config.queues):
+            total += await self.driver.requeue_stuck_jobs(timeout, queue=queue)
+        if total:
+            logger.warning(
+                "Requeued %d stuck processing job(s) older than %.0fs",
+                total, timeout,
+            )
+        return total
 
     async def _heartbeat_loop(self) -> None:
         while self._running:

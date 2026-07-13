@@ -103,6 +103,18 @@ def cli(ctx: click.Context, config: str | None, verbose: bool) -> None:
     "--no-disk-full-cleanup", is_flag=True,
     help="Disable automatic emergency cleanup when the driver returns a disk-full error.",
 )
+@click.option(
+    "--no-stuck-job-recovery", is_flag=True,
+    help="Disable automatic recovery of jobs stuck in processing.",
+)
+@click.option(
+    "--stuck-job-timeout-seconds", type=int, default=None,
+    help="Requeue processing jobs older than N seconds (default 3600).",
+)
+@click.option(
+    "--stuck-job-check-interval-seconds", type=int, default=None,
+    help="How often stuck-job recovery runs, in seconds (default 60).",
+)
 @click.pass_context
 def work(
     ctx: click.Context,
@@ -119,6 +131,9 @@ def work(
     prune_other_seconds: int | None,
     prune_interval_seconds: int | None,
     no_disk_full_cleanup: bool,
+    no_stuck_job_recovery: bool,
+    stuck_job_timeout_seconds: int | None,
+    stuck_job_check_interval_seconds: int | None,
 ) -> None:
     """Start processing jobs."""
     config: BaQueueConfig = ctx.obj["config"]
@@ -143,6 +158,13 @@ def work(
         sleep=sleep,
         timeout=timeout,
         max_jobs_per_worker=max_jobs,
+        recover_stuck_jobs=not no_stuck_job_recovery,
+        stuck_processing_seconds=(
+            3600 if stuck_job_timeout_seconds is None else stuck_job_timeout_seconds
+        ),
+        stuck_check_interval_seconds=(
+            60 if stuck_job_check_interval_seconds is None else stuck_job_check_interval_seconds
+        ),
     )
 
     _validate_driver(driver)
@@ -162,6 +184,13 @@ def work(
     click.echo(
         f"  Disk-full cleanup: {'enabled' if config.auto_cleanup_on_disk_full else 'disabled'}"
     )
+    if supervisor_config.recover_stuck_jobs:
+        click.echo(
+            f"  Stuck-job recovery: processing>{supervisor_config.stuck_processing_seconds}s, "
+            f"every {supervisor_config.stuck_check_interval_seconds}s"
+        )
+    else:
+        click.echo("  Stuck-job recovery: disabled")
     click.echo()
 
     _run_async(_run_worker, config, supervisor_config)

@@ -317,6 +317,33 @@ class PostgresDriver(BaseDriver):
 
         await self._with_disk_full_recovery(_do)
 
+    async def requeue_stuck_jobs(
+        self,
+        older_than_seconds: float,
+        queue: str | None = None,
+    ) -> int:
+        now = _now_ts()
+        cutoff = now - older_than_seconds
+        conditions = ["status='processing'", "COALESCE(started_at, updated_at) <= $2"]
+        params: list[Any] = [now, cutoff]
+        idx = 3
+        if queue:
+            conditions.append(f"queue=${idx}")
+            params.append(queue)
+        where = " AND ".join(conditions)
+
+        async def _do():
+            async with self._pool.acquire() as conn:
+                return await conn.execute(
+                    f"""UPDATE {self._jobs_table}
+                        SET status='pending', started_at=NULL, delay_until=NULL, updated_at=$1
+                        WHERE {where}""",
+                    *params,
+                )
+
+        result = await self._with_disk_full_recovery(_do)
+        return int(result.split()[-1])
+
     async def delete(self, job_id: str) -> None:
         async def _do():
             async with self._pool.acquire() as conn:

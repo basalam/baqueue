@@ -113,6 +113,15 @@ class BaseDriver(ABC):
         ...
 
     @abstractmethod
+    async def requeue_stuck_jobs(
+        self,
+        older_than_seconds: float,
+        queue: str | None = None,
+    ) -> int:
+        """Move stale processing jobs back to pending. Returns count requeued."""
+        ...
+
+    @abstractmethod
     async def delete(self, job_id: str) -> None: ...
 
     async def promote(self, job_id: str) -> bool:

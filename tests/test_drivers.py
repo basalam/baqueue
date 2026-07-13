@@ -96,6 +96,37 @@ class TestJobLifecycle:
         # Should not be immediately available
         assert await driver.pop("default") is None
 
+    async def test_requeue_stuck_processing_returns_to_queue(self, driver, monkeypatch):
+        import baqueue.drivers.memory_driver as memory_module
+        import baqueue.drivers.sqlite_driver as sqlite_module
+
+        payload = _make_payload(queue="default")
+        await driver.push(payload)
+
+        stale_started_at = _now_ts() - 7200
+        monkeypatch.setattr(memory_module, "_now_ts", lambda: stale_started_at)
+        monkeypatch.setattr(sqlite_module, "_now_ts", lambda: stale_started_at)
+        popped = await driver.pop("default")
+        monkeypatch.setattr(memory_module, "_now_ts", _now_ts)
+        monkeypatch.setattr(sqlite_module, "_now_ts", _now_ts)
+
+        assert popped is not None
+        assert popped.status == "processing"
+
+        assert await driver.requeue_stuck_jobs(older_than_seconds=3600, queue="other") == 0
+        assert await driver.pop("default") is None
+
+        assert await driver.requeue_stuck_jobs(older_than_seconds=3600, queue="default") == 1
+        recovered = await driver.get_job(payload.id)
+        assert recovered.status == "pending"
+        assert recovered.started_at is None
+        assert recovered.delay_until is None
+
+        again = await driver.pop("default")
+        assert again is not None
+        assert again.id == payload.id
+        assert again.attempts == 2
+
     async def test_delete_removes_job(self, driver):
         payload = _make_payload(queue="default")
         await driver.push(payload)

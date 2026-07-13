@@ -369,6 +369,36 @@ class SqliteDriver(BaseDriver):
                 c.commit()
             await self._execute_with_retry(_do)
 
+    async def requeue_stuck_jobs(
+        self,
+        older_than_seconds: float,
+        queue: str | None = None,
+    ) -> int:
+        now = _now_ts()
+        cutoff = now - older_than_seconds
+        conditions = ["status='processing'", "COALESCE(started_at, updated_at) <= ?"]
+        params: list[Any] = [cutoff]
+        if queue:
+            conditions.append("queue=?")
+            params.append(queue)
+        params.insert(0, now)
+        where = " AND ".join(conditions)
+        result = [0]
+
+        async with self._lock:
+            def _do():
+                c = self._get_conn()
+                cur = c.execute(
+                    f"""UPDATE jobs
+                        SET status='pending', started_at=NULL, delay_until=NULL, updated_at=?
+                        WHERE {where}""",
+                    params,
+                )
+                c.commit()
+                result[0] = cur.rowcount
+            await self._execute_with_retry(_do)
+        return result[0]
+
     async def delete(self, job_id: str) -> None:
         async with self._lock:
             def _do():

@@ -270,6 +270,37 @@ class TestPromoteRedis:
         assert await redis_driver.promote("nope") is False
 
 
+class TestRequeueStuckRedis:
+    async def test_requeue_stuck_processing_updates_indexes_and_ready_list(self, redis_driver):
+        d = redis_driver
+        p = _payload(queue="q1")
+        await d.push(p)
+
+        popped = await d.pop("q1")
+        assert popped is not None
+        stale_started_at = _now_ts() - 7200
+        popped.started_at = stale_started_at
+        popped.updated_at = stale_started_at
+        await d._redis.hset(d._key("job", popped.id), mapping={"data": popped.to_json()})
+
+        assert await d.requeue_stuck_jobs(older_than_seconds=3600, queue="q1") == 1
+
+        recovered = await d.get_job(popped.id)
+        assert recovered.status == "pending"
+        assert recovered.started_at is None
+        assert await d._redis.lrange(d._key("queue", "q1"), 0, -1) == [popped.id]
+        assert int(await d._redis.zcard(d._idx_queue_status("q1", "processing"))) == 0
+        assert int(await d._redis.zcard(d._idx_queue_status("q1", "pending"))) == 1
+
+        assert await d.requeue_stuck_jobs(older_than_seconds=3600, queue="q1") == 0
+        assert await d._redis.lrange(d._key("queue", "q1"), 0, -1) == [popped.id]
+
+        again = await d.pop("q1")
+        assert again is not None
+        assert again.id == popped.id
+        assert again.attempts == 2
+
+
 class TestHistoryPersistenceRedis:
     async def test_history_survives_retry_round_trip(self, redis_driver):
         d = redis_driver
