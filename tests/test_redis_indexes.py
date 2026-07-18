@@ -8,6 +8,8 @@ ZSET families.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from baqueue.serializer import JobPayload, _now_ts
@@ -268,6 +270,47 @@ class TestPromoteRedis:
 
     async def test_promote_missing_returns_false(self, redis_driver):
         assert await redis_driver.promote("nope") is False
+
+    async def test_concurrent_delayed_pollers_enqueue_once(self, redis_driver, monkeypatch):
+        d = redis_driver
+        p = _payload(queue="q1", delay_until=_now_ts() + 0.05)
+        await d.push(p)
+        await asyncio.sleep(0.1)
+
+        original = d._redis.zrangebyscore
+        both_read = asyncio.Event()
+        readers = 0
+
+        async def synchronized_read(*args, **kwargs):
+            nonlocal readers
+            result = await original(*args, **kwargs)
+            readers += 1
+            if readers == 2:
+                both_read.set()
+            await both_read.wait()
+            return result
+
+        monkeypatch.setattr(d._redis, "zrangebyscore", synchronized_read)
+        moved = await asyncio.gather(d.pop_delayed(), d.pop_delayed())
+
+        assert sum(len(batch) for batch in moved) == 1
+        assert await d._redis.lrange(d._key("queue", "q1"), 0, -1) == [p.id]
+
+    async def test_pop_discards_duplicate_non_pending_entries(self, redis_driver):
+        d = redis_driver
+        p = _payload(queue="q1")
+        await d.push(p)
+        await d._redis.rpush(d._key("queue", "q1"), p.id, p.id)
+
+        popped = await d.pop("q1")
+        assert popped is not None and popped.id == p.id
+        assert await d.pop("q1") is None
+
+        stored = await d.get_job(p.id)
+        assert stored is not None
+        assert stored.status == "processing"
+        assert stored.attempts == 1
+        assert await d._redis.llen(d._key("queue", "q1")) == 0
 
 
 class TestRequeueStuckRedis:

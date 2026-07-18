@@ -44,6 +44,7 @@ class Worker:
         self._current_job: JobPayload | None = None
         self._jobs_processed = 0
         self._jobs_failed = 0
+        self._queue_cursor = 0
 
     @property
     def is_running(self) -> bool:
@@ -84,10 +85,18 @@ class Worker:
         self._running = False
 
     async def _fetch_next(self) -> JobPayload | None:
-        for queue in self.queues:
-            job = await self.driver.pop(queue)
+        queue_count = len(self.queues)
+        if queue_count == 0:
+            return None
+
+        for offset in range(queue_count):
+            index = (self._queue_cursor + offset) % queue_count
+            job = await self.driver.pop(self.queues[index])
             if job:
+                self._queue_cursor = (index + 1) % queue_count
                 return job
+
+        self._queue_cursor = (self._queue_cursor + 1) % queue_count
         return None
 
     @staticmethod

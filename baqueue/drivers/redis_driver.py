@@ -15,6 +15,7 @@ logger = logging.getLogger("baqueue.redis")
 # the job hash is gone, so we can't read its status — we ZREM from every global
 # status index to be sure the stale id is cleared.
 _ALL_STATUSES = ("pending", "processing", "completed", "failed", "cancelled")
+_MAX_STALE_POP_ATTEMPTS = 100
 
 
 class RedisDriver(BaseDriver):
@@ -202,28 +203,110 @@ class RedisDriver(BaseDriver):
         await self._with_disk_full_recovery(_do)
         return ids
 
-    async def pop(self, queue: str) -> JobPayload | None:
-        job_id = await self._redis.lpop(self._key("queue", queue))
-        if not job_id:
-            return None
-        raw = await self._redis.hget(self._key("job", job_id), "data")
-        if not raw:
-            return None
-        payload = JobPayload.from_json(raw)
-        old_status = payload.status
-        payload.status = "processing"
-        now = _now_ts()
-        payload.started_at = now
-        payload.updated_at = now
-        payload.attempts += 1
+    async def _claim_pending_job(self, job_id: str) -> JobPayload | None:
+        from redis.exceptions import WatchError
 
-        async def _do():
+        job_key = self._key("job", job_id)
+
+        async def _attempt() -> JobPayload | None:
             pipe = self._redis.pipeline()
-            pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
-            self._index_status_change(pipe, payload.id, payload.queue, old_status, payload.status, payload.created_at)
-            await pipe.execute()
-        await self._with_disk_full_recovery(_do)
-        return payload
+            try:
+                await pipe.watch(job_key)
+                raw = await pipe.hget(job_key, "data")
+                if not raw:
+                    return None
+
+                payload = JobPayload.from_json(raw)
+                if payload.status != "pending":
+                    return None
+                if payload.delay_until is not None and payload.delay_until > _now_ts():
+                    return None
+
+                payload.status = "processing"
+                now = _now_ts()
+                payload.started_at = now
+                payload.updated_at = now
+                payload.attempts += 1
+
+                pipe.multi()
+                pipe.hset(job_key, mapping={"data": payload.to_json()})
+                self._index_status_change(
+                    pipe,
+                    payload.id,
+                    payload.queue,
+                    "pending",
+                    "processing",
+                    payload.created_at,
+                )
+                await pipe.execute()
+                return payload
+            finally:
+                await pipe.reset()
+
+        for _ in range(5):
+            try:
+                return await self._with_disk_full_recovery(_attempt)
+            except WatchError:
+                continue
+        return None
+
+    async def pop(self, queue: str) -> JobPayload | None:
+        for _ in range(_MAX_STALE_POP_ATTEMPTS):
+            job_id = await self._redis.lpop(self._key("queue", queue))
+            if not job_id:
+                return None
+            payload = await self._claim_pending_job(job_id)
+            if payload is not None:
+                return payload
+        return None
+
+    async def _promote_delayed_job(self, job_id: str, now: float) -> JobPayload | None:
+        from redis.exceptions import WatchError
+
+        job_key = self._key("job", job_id)
+
+        async def _attempt() -> JobPayload | None:
+            pipe = self._redis.pipeline()
+            try:
+                await pipe.watch(job_key)
+                raw = await pipe.hget(job_key, "data")
+                if not raw:
+                    pipe.multi()
+                    pipe.zrem(self._key("delayed"), job_id)
+                    await pipe.execute()
+                    return None
+
+                payload = JobPayload.from_json(raw)
+                if payload.status != "pending" or payload.delay_until is None:
+                    pipe.multi()
+                    pipe.zrem(self._key("delayed"), job_id)
+                    await pipe.execute()
+                    return None
+                if payload.delay_until > now:
+                    pipe.multi()
+                    pipe.zadd(self._key("delayed"), {job_id: payload.delay_until})
+                    await pipe.execute()
+                    return None
+
+                payload.delay_until = None
+                payload.updated_at = now
+
+                pipe.multi()
+                pipe.hset(job_key, mapping={"data": payload.to_json()})
+                pipe.zrem(self._key("delayed"), job_id)
+                pipe.lrem(self._key("queue", payload.queue), 0, job_id)
+                pipe.rpush(self._key("queue", payload.queue), job_id)
+                await pipe.execute()
+                return payload
+            finally:
+                await pipe.reset()
+
+        for _ in range(5):
+            try:
+                return await self._with_disk_full_recovery(_attempt)
+            except WatchError:
+                continue
+        return None
 
     async def pop_delayed(self) -> list[JobPayload]:
         now = _now_ts()
@@ -231,27 +314,10 @@ class RedisDriver(BaseDriver):
         if not job_ids:
             return []
 
-        async def _remove_delayed():
-            pipe = self._redis.pipeline()
-            for job_id in job_ids:
-                pipe.zrem(self._key("delayed"), job_id)
-            await pipe.execute()
-        await self._with_disk_full_recovery(_remove_delayed)
-
         moved: list[JobPayload] = []
         for job_id in job_ids:
-            raw = await self._redis.hget(self._key("job", job_id), "data")
-            if raw:
-                payload = JobPayload.from_json(raw)
-                payload.delay_until = None
-                payload.updated_at = _now_ts()
-
-                async def _move(payload=payload):
-                    pipe = self._redis.pipeline()
-                    pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
-                    pipe.rpush(self._key("queue", payload.queue), payload.id)
-                    await pipe.execute()
-                await self._with_disk_full_recovery(_move)
+            payload = await self._promote_delayed_job(job_id, now)
+            if payload is not None:
                 moved.append(payload)
         return moved
 
@@ -285,6 +351,7 @@ class RedisDriver(BaseDriver):
 
         async def _do():
             pipe = self._redis.pipeline()
+            pipe.lrem(self._key("queue", payload.queue), 0, payload.id)
             if delay > 0:
                 payload.delay_until = _now_ts() + delay
                 pipe.hset(self._key("job", payload.id), mapping={"data": payload.to_json()})
@@ -402,8 +469,8 @@ class RedisDriver(BaseDriver):
         now = _now_ts()
         # Only a job actually sitting in the delayed ZSET needs to be moved into
         # its ready list. A pending job that is already ready (delay_until None or
-        # in the past) must NOT be re-pushed, or Redis pop — which does not
-        # re-check status — would process it twice.
+        # in the past) must NOT be re-pushed, or it would leave duplicate ready
+        # entries that every worker has to discard later.
         was_scheduled = payload.delay_until is not None and payload.delay_until > now
         payload.delay_until = None
         payload.updated_at = now

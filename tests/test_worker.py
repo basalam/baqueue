@@ -86,6 +86,20 @@ class FailsOnceThenSucceedsJob(Job):
         return "ok"
 
 
+class FirstQueueJob(Job):
+    queue = "first"
+
+    async def handle(self):
+        return None
+
+
+class SecondQueueJob(Job):
+    queue = "second"
+
+    async def handle(self):
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _configure_queue():
     Queue.configure(BaQueueConfig(driver=DriverConfig(name="memory")))
@@ -112,6 +126,24 @@ async def _run_worker_once(worker: Worker, jobs_to_process: int = 1, max_wait: f
 
 
 class TestSuccessfulExecution:
+    async def test_fetches_from_multiple_queues_fairly(self):
+        await Queue.connect()
+        await Queue.push(FirstQueueJob)
+        await Queue.push(FirstQueueJob)
+        await Queue.push(SecondQueueJob)
+
+        worker = Worker(
+            driver=Queue.get_driver(), queues=["first", "second"],
+            sleep_interval=0.05, name="w-fair",
+        )
+
+        first = await worker._fetch_next()
+        second = await worker._fetch_next()
+
+        assert first is not None and first.queue == "first"
+        assert second is not None and second.queue == "second"
+        await Queue.disconnect()
+
     async def test_runs_and_completes_job(self):
         await Queue.connect()
         await Queue.push(GoodJob, n=42)
